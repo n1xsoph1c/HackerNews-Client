@@ -5,13 +5,11 @@ import {
   getOllamaClient,
   buildRichSummaryPrompt,
   selectCommentsForSummary,
-  findCommentId,
 } from "@/lib/ollama"
 import { fetchStoryWithComments } from "@/lib/hn-api"
+import { getInFlightPromise, parseCacheAndStore } from "@/lib/summarize-background"
 
 export const maxDuration = 300
-
-type WorthReadingRaw = { author: string; preview: string; why: string }
 
 export async function POST(request: NextRequest) {
   const body = await request.json()
@@ -26,29 +24,63 @@ export async function POST(request: NextRequest) {
   // Return cached summary if it exists for the same model AND has rich fields
   const cached = await db.summary.findUnique({ where: { storyId } })
   if (cached && cached.model === model && cached.overview !== null) {
-    const data = JSON.stringify({
-      type: "complete",
+    return sseComplete({
       cached: true,
-      // Rich fields
       overview: cached.overview,
       insights: cached.insights,
       worthReading: cached.worthReading,
       verdict: cached.verdict,
       sentiment: cached.sentiment,
-      // Legacy fallback fields
       keyPoints: cached.keyPoints,
       summary: cached.summary,
     })
-    return new Response(`data: ${data}\n\n`, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
-    })
   }
 
-  // Fetch full comment tree for summarization (needed for smart sampling + ID resolution)
+  // If background pre-gen is already running for this story, await it then serve cache
+  const inFlight = getInFlightPromise(storyId, model)
+  if (inFlight) {
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          // Emit a waiting token so the client knows something is happening
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ type: "token", token: "" })}\n\n`
+          ))
+          await inFlight
+          const fresh = await db.summary.findUnique({ where: { storyId } })
+          if (fresh?.overview) {
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({
+                type: "complete",
+                overview: fresh.overview,
+                insights: fresh.insights,
+                worthReading: fresh.worthReading,
+                verdict: fresh.verdict,
+                sentiment: fresh.sentiment,
+                keyPoints: fresh.keyPoints,
+                summary: fresh.summary,
+              })}\n\n`
+            ))
+          } else {
+            // Background job failed — fall through would require re-fetch; emit error
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ type: "error", message: "Summary generation failed, please try again" })}\n\n`
+            ))
+          }
+        } catch (err) {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`
+          ))
+        } finally {
+          controller.close()
+        }
+      },
+    })
+    return new Response(stream, sseHeaders())
+  }
+
+  // No cache, no in-flight — generate now (explicit user request, always proceeds)
   const storyData = await fetchStoryWithComments(storyId)
   if (!storyData) {
     return new Response("Story not found", { status: 404 })
@@ -58,7 +90,6 @@ export async function POST(request: NextRequest) {
   const commentsText = selectCommentsForSummary(storyData.comments, model)
   const prompt = buildRichSummaryPrompt(commentsText, title)
   const ollama = getOllamaClient()
-
   const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
@@ -69,108 +100,66 @@ export async function POST(request: NextRequest) {
           model,
           messages: [{ role: "user", content: prompt }],
           stream: true,
+          options: { temperature: 0, num_predict: 400 },
         })
 
         for await (const chunk of response) {
           const token = chunk.message.content
           fullText += token
-          const event = `data: ${JSON.stringify({ type: "token", token })}\n\n`
-          controller.enqueue(encoder.encode(event))
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ type: "token", token })}\n\n`
+          ))
         }
 
-        // Parse and cache
+        // Parse, cache, and send complete event
         try {
-          const jsonMatch = fullText.match(/\{[\s\S]*\}/)
-          if (jsonMatch) {
-            let parsed = JSON.parse(jsonMatch[0])
-            // Small models sometimes wrap the full JSON inside the "overview" field.
-            // Detect and unwrap: if overview is itself a valid JSON object, use that.
-            if (
-              parsed.overview &&
-              typeof parsed.overview === "string" &&
-              parsed.overview.trim().startsWith("{")
-            ) {
-              try {
-                const inner = JSON.parse(parsed.overview)
-                if (inner.insights || inner.worth_reading) parsed = inner
-              } catch { /* not double-encoded — keep original */ }
-            }
-
-            // Resolve worth_reading comment IDs server-side
-            const worthReadingRaw: WorthReadingRaw[] = parsed.worth_reading ?? []
-            const worthReading = worthReadingRaw.map((wr) => ({
-              ...wr,
-              commentId: findCommentId(storyData.comments, wr.author, wr.preview),
-            }))
-
-            // Legacy keyPoints from insights titles for backward compat
-            const keyPoints = (parsed.insights ?? []).map((i: { title: string }) => i.title)
-
-            await db.summary.upsert({
-              where: { storyId },
-              update: {
-                overview: parsed.overview ?? "",
-                insights: parsed.insights ?? [],
-                worthReading,
-                verdict: parsed.verdict ?? "",
-                sentiment: parsed.sentiment ?? "neutral",
-                keyPoints,
-                summary: parsed.overview ?? "",
-                model,
-              },
-              create: {
-                storyId,
-                overview: parsed.overview ?? "",
-                insights: parsed.insights ?? [],
-                worthReading,
-                verdict: parsed.verdict ?? "",
-                sentiment: parsed.sentiment ?? "neutral",
-                keyPoints,
-                summary: parsed.overview ?? "",
-                model,
-              },
-            })
-
-            const doneEvent = `data: ${JSON.stringify({
-              type: "complete",
-              overview: parsed.overview,
-              insights: parsed.insights,
-              worthReading,
-              verdict: parsed.verdict,
-              sentiment: parsed.sentiment,
-              keyPoints,
-              summary: parsed.overview,
-            })}\n\n`
-            controller.enqueue(encoder.encode(doneEvent))
+          const result = await parseCacheAndStore(fullText, storyId, model, storyData.comments)
+          if (result) {
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ type: "complete", ...result })}\n\n`
+            ))
           }
         } catch {
           // JSON parse failed — send raw text as fallback
-          const doneEvent = `data: ${JSON.stringify({
-            type: "complete",
-            overview: fullText,
-            insights: [],
-            worthReading: [],
-            verdict: "",
-            sentiment: "neutral",
-            keyPoints: [],
-            summary: fullText,
-          })}\n\n`
-          controller.enqueue(encoder.encode(doneEvent))
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({
+              type: "complete",
+              overview: fullText,
+              insights: [],
+              worthReading: [],
+              verdict: "",
+              sentiment: "neutral",
+              keyPoints: [],
+              summary: fullText,
+            })}\n\n`
+          ))
         }
       } catch (err) {
-        const errEvent = `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`
-        controller.enqueue(encoder.encode(errEvent))
+        controller.enqueue(encoder.encode(
+          `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`
+        ))
       } finally {
         controller.close()
       }
     },
   })
 
-  return new Response(stream, {
+  return new Response(stream, sseHeaders())
+}
+
+function sseHeaders() {
+  return {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
     },
-  })
+  }
+}
+
+function sseComplete(data: Record<string, unknown>) {
+  return new Response(
+    `data: ${JSON.stringify({ type: "complete", ...data })}\n\n`,
+    sseHeaders()
+  )
 }

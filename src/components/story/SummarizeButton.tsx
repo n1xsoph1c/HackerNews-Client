@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Sparkles, Loader2, ChevronDown, ChevronUp,
   Info, MessageSquare, AlertTriangle, Lightbulb, ArrowLeftRight,
@@ -95,6 +95,30 @@ export function SummarizeButton({
     error: null,
   })
   const [open, setOpen] = useState(true)
+
+  // Progressive extraction — show overview + insights as they stream, before full JSON is complete
+  useEffect(() => {
+    const { streaming, streamedText } = state
+    if (!streaming || !streamedText) return
+
+    // Extract overview as soon as the JSON string value is closed
+    const ovMatch = streamedText.match(/"overview"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+    if (ovMatch && !state.overview) {
+      const decoded = ovMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')
+      setState(s => ({ ...s, overview: decoded }))
+    }
+
+    // Extract completed insight objects (each has at least title + type)
+    const insightMatches = [
+      ...streamedText.matchAll(/\{\s*"title"\s*:[^{}]*"type"\s*:\s*"[^"]*"\s*\}/g)
+    ]
+    if (insightMatches.length > state.insights.length) {
+      try {
+        const newInsights = insightMatches.map(m => JSON.parse(m[0])) as Insight[]
+        setState(s => ({ ...s, insights: newInsights }))
+      } catch { /* partial match — skip */ }
+    }
+  }, [state.streamedText]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function summarize() {
     setState(s => ({ ...s, streaming: true, streamedText: '', done: false, error: null }))
