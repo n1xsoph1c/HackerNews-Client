@@ -193,19 +193,28 @@ export function SummarizeButton({
           >
             <div className="p-4 rounded-xl bg-[var(--surface)] border border-[var(--border-color)] space-y-4">
 
-              {/* Streaming raw text */}
-              {streaming && streamedText && (
-                <p className="text-sm text-[var(--muted-foreground)] font-mono leading-relaxed whitespace-pre-wrap">
-                  {streamedText}
-                  <span className="inline-block w-0.5 h-4 bg-brand ml-0.5 animate-pulse" />
-                </p>
-              )}
-
-              {/* Waiting for first token */}
-              {streaming && !streamedText && (
-                <div className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
-                  <Loader2 className="size-3.5 animate-spin" />
-                  <span>Analyzing discussion...</span>
+              {/* Streaming state — show token count progress, not raw JSON */}
+              {streaming && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+                    <Loader2 className="size-3.5 animate-spin shrink-0" />
+                    <span>
+                      {streamedText
+                        ? `Thinking… (${streamedText.length} tokens)`
+                        : 'Analyzing discussion…'}
+                    </span>
+                  </div>
+                  {streamedText && (
+                    <div className="flex gap-1">
+                      {[0, 1, 2].map(i => (
+                        <span
+                          key={i}
+                          className="inline-block w-1.5 h-1.5 rounded-full bg-brand animate-pulse"
+                          style={{ animationDelay: `${i * 150}ms` }}
+                        />
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 

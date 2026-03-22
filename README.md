@@ -1,36 +1,231 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# HN Reader
 
-## Getting Started
-
-First, run the development server:
+A Hacker News client with AI-powered discussion summaries. One command to run everything.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Access at **http://localhost:8000**
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## What It Does
 
-## Learn More
+- **Feed** — Browse top/new/best HN stories with infinite scroll
+- **Story detail** — Threaded comment discussions, lazy-loaded for instant page opens
+- **AI Summary** — Click "Summarize Discussion" for a streaming summary: key insights with explanations, clickable "worth reading" chips that scroll directly to specific comments
+- **Bookmarks** — Save and search stories locally
+- **Model Manager** — Install Ollama models, switch active model, watch live download progress (MB/s, ETA)
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Architecture
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```
+Browser
+  └─► Next.js 16 App Router (SSR + API routes, port 8000)
+        │
+        ├─► /api/stories           HN Firebase API (story feed, comment trees)
+        │       └── StoryCache     PostgreSQL cache (10-min TTL, stale-while-revalidate)
+        │
+        ├─► /api/comments/[id]/replies   Lazy reply loading (1 level per click)
+        │
+        ├─► /api/summarize         SSE streaming → Ollama → token-by-token
+        │       └── Summary        PostgreSQL cache (invalidated on model change)
+        │
+        ├─► /api/bookmarks         CRUD, ILIKE search
+        │
+        └─► /api/ollama/*          Model management (list, pull, active)
+                                   Ollama pull progress streamed via SSE
+```
 
-## Deploy on Vercel
+### Story Page Request Flow
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```
+User clicks story card
+        │
+        ▼
+[Hover prefetch] → GET /api/stories/[id]
+        │
+        ▼
+StoryCache hit? ─── YES ──► Serve from DB (~100ms)
+        │
+       NO
+        │
+        ▼
+fetchStoryShallow()          ← depth-0 only, ~20-50 HN API calls
+        │
+        ├──► Render page immediately
+        │
+        └──► setCachedStory() (background, non-blocking)
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+User expands a comment with replies
+        │
+        ▼
+GET /api/comments/[id]/replies   ← 1 level deep, ~5-30 HN API calls
+        │
+        ▼
+Children append to Comment component state
+```
+
+### AI Summary Flow
+
+```
+User clicks "Summarize Discussion"
+        │
+        ▼
+POST /api/summarize { storyId, storyTitle }
+        │
+        ▼
+Summary in DB? (same model, has overview field?)
+        │
+       YES ──────────────────────────────────────────► Return cached instantly
+        │
+       NO
+        │
+        ▼
+fetchStoryWithComments()    ← full BFS tree (for sampling + ID resolution)
+        │
+        ▼
+selectCommentsForSummary()
+  ├── Flatten all comments with depth + char count
+  ├── Filter < 40 chars (noise)
+  ├── Sort by depth-0 first, then length DESC
+  ├── Sample across thread (beginning/middle/end)
+  └── Pack into budget: 3b→3500, 7b→6000, 70b→12000 chars
+        │
+        ▼
+ollama.chat({ stream: true })
+        │
+        ▼
+SSE tokens stream to browser ──────────────────────► "Thinking… (N tokens)"
+        │
+        ▼ (on stream complete)
+JSON.parse(fullText)
+  └── Double-encoding fix: if overview wraps full JSON, unwrap it
+        │
+        ▼
+resolveCommentIds()    ← match worth_reading.author + preview → comment DOM id
+        │
+        ▼
+db.summary.upsert()
+        │
+        ▼
+SSE "complete" event ──────────────────────────────► Render rich summary UI:
+                                                       - Overview paragraph
+                                                       - Insight cards (icon + type)
+                                                       - "Worth Reading" chips
+                                                         (click → smooth scroll
+                                                          + highlight ring)
+                                                       - Verdict line
+```
+
+---
+
+## Stack
+
+| Package | Version | Notes |
+|---------|---------|-------|
+| `next` | 16.2.x | App Router; `params`/`searchParams` are async Promises |
+| `tailwindcss` | v4 | CSS-first config in `globals.css @theme {}` — no `tailwind.config.ts` |
+| `motion` | 12.x | Formerly `framer-motion` — import from `'motion/react'` |
+| `prisma` | 7.x | Rust-free; generated client at `src/generated/prisma/client` |
+| `@prisma/adapter-pg` | — | Required by Prisma 7 for DB connections (replaces `url` in schema) |
+| `ollama` | latest | Official JS client; streaming via `stream: true` |
+| `shadcn/ui` | latest | `new-york` style, OKLCH colors, Tailwind v4-compatible |
+| `lucide-react` | — | Icons throughout |
+
+---
+
+## Build Timeline
+
+**Total time: ~1 working session (~8 hours)**
+
+| Phase | Time spent | Where time went |
+|-------|-----------|-----------------|
+| Research & planning | ~1h | Next.js 16 async APIs, Tailwind v4 config changes, Prisma 7 breaking changes, motion rename |
+| Scaffolding & deps | ~45m | create-next-app in temp dir (capital letters in pkg name), shadcn init issues, class-variance-authority missing |
+| Prisma 7 debugging | ~1.5h | `prisma-client` generator needs explicit output path; datasource url removed; `@prisma/adapter-pg` required; import path changed to `@/generated/prisma/client` |
+| Docker + infra | ~1h | Ollama healthcheck (curl not in image → `ollama list`); `prisma migrate deploy` fails without migration files → switched to `prisma db push`; Node 18 on VPS but Next.js 16 requires ≥20 |
+| Backend API routes | ~1h | All 9 routes, SSE streaming for summarize + pull, BFS comment tree with Semaphore |
+| Frontend components | ~1.5h | Story page two-column layout, Comment recursive with AnimatePresence, SummarizeButton SSE consumer, PullProgress |
+| Performance pass | ~1h | StoryCache DB table, fetchStoryShallow, lazy reply loading, skeleton screens, hover prefetch |
+| AI quality pass | ~45m | selectCommentsForSummary (smart sampling), rich prompt + output schema, commentId resolution, double-encoding fix |
+
+**Biggest time sinks:**
+1. **Prisma 7** — entirely undocumented breaking changes (generator name, adapter-based connection, output path required)
+2. **Node version on VPS** — Next.js 16 requires Node 20, VPS had Node 18, required nvm setup
+3. **Ollama Docker healthcheck** — curl/wget not available in `ollama/ollama` image
+4. **LLM output parsing** — small models (3.2b) double-encode JSON (output the full JSON as a string inside the `overview` field)
+
+---
+
+## GPU Setup (Recommended)
+
+CPU mode (default) runs `llama3.2:3b` at ~6 tokens/sec — functional but slow on large threads. For GPU (e.g. RTX 5060 Ti):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+Override the model via env:
+```bash
+OLLAMA_MODEL=qwen2.5:7b docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+Context budget scales automatically with model size:
+- `3b` models → 3,500 chars of comments sampled
+- `7b/8b` models → 6,000 chars
+- `70b+` models → 12,000 chars
+
+---
+
+## Environment Variables
+
+```env
+DATABASE_URL=postgresql://postgres:password@db:5432/hnapp
+OLLAMA_BASE_URL=http://ollama:11434
+OLLAMA_MODEL=llama3.2:3b   # override per run
+```
+
+---
+
+## Development
+
+```bash
+npm install
+npm run dev           # Turbopack, port 3000
+npm run build         # production build + type check
+
+npx prisma db push    # sync schema to DB (idempotent)
+npx prisma generate   # regenerate TS client after schema changes
+npx prisma studio     # visual DB browser
+```
+
+Requires `.env` with `DATABASE_URL` + `OLLAMA_BASE_URL` pointing to running instances.
+
+---
+
+## Key Technical Decisions
+
+**Why Ollama?** No API keys, no cost, runs entirely in Docker, model is swappable. On GPU it's excellent.
+
+**Why `prisma db push` instead of migrations?** Single-dev portfolio project — `db push` is idempotent and schema-as-truth. Multi-environment production would use `prisma migrate`.
+
+**Why shallow comment loading?** A 200-comment thread requires 200+ HN API calls at depth 3. Fetching depth-0 first drops this to ~30. Replies lazy-load per-comment on expand.
+
+**Why PostgreSQL for caching instead of Redis?** Keep infrastructure minimal — Postgres is already present. For high-traffic use, Redis would be more appropriate for the hot path.
+
+**Why smart comment sampling?** Sequential truncation always picks the same early comments, missing the rest of the thread. The sampler scores by depth + length and samples across beginning/middle/end for representative coverage within the LLM context window.
+
+**Why SSE instead of WebSockets?** One-directional streaming (server→client), simpler, works with Next.js route handlers without extra setup. Ollama's JS client exposes an async iterator that maps naturally to SSE.
+
+---
+
+## Docker Notes
+
+- First run downloads the model in background — app starts immediately, track at `/models`
+- `docker compose down -v` resets everything including DB and model volumes
+- Volumes `postgres_data` + `ollama_data` persist across `docker compose down` (without `-v`)
+- The `app` service entrypoint runs `prisma db push` then starts `node server.js`
