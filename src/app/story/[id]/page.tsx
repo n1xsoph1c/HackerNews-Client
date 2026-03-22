@@ -1,0 +1,73 @@
+import { Suspense } from 'react'
+import { notFound } from 'next/navigation'
+import { fetchStoryWithComments } from '@/lib/hn-api'
+import { StoryHeader } from '@/components/story/StoryHeader'
+import { SummarizeButton } from '@/components/story/SummarizeButton'
+import { CommentThread } from '@/components/story/CommentThread'
+import { Loader2 } from 'lucide-react'
+
+export default async function StoryPage({
+  params,
+}: {
+  params: Promise<{ id: string }>
+}) {
+  const { id } = await params
+  const storyId = parseInt(id, 10)
+
+  const data = await fetchStoryWithComments(storyId).catch(() => null)
+
+  if (!data) notFound()
+
+  const { story, comments } = data
+
+  function countAll(items: typeof comments): number {
+    return items.reduce((sum, c) => sum + 1 + countAll(c.children), 0)
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-6">
+      {/* Mobile: stacked layout */}
+      <div className="md:hidden space-y-6">
+        <StoryHeader story={story} />
+        <SummarizeButton storyId={storyId} />
+        <div>
+          <h2 className="text-sm font-semibold text-[var(--muted-foreground)] uppercase tracking-wider mb-4">
+            Discussion
+          </h2>
+          <Suspense fallback={<Loader2 className="size-5 animate-spin text-[var(--muted-foreground)]" />}>
+            <CommentThread comments={comments} totalCount={story.descendants ?? 0} />
+          </Suspense>
+        </div>
+      </div>
+
+      {/* Desktop: two-column immersive layout */}
+      <div className="hidden md:grid md:grid-cols-[380px_1fr] gap-8">
+        {/* Left panel: sticky */}
+        <div className="sticky top-20 self-start space-y-6 max-h-[calc(100vh-6rem)] overflow-y-auto scrollbar-thin pr-2">
+          <StoryHeader story={story} />
+          <div className="border-t border-[var(--border-color)] pt-6">
+            <p className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider mb-3">
+              AI Summary
+            </p>
+            <SummarizeButton storyId={storyId} />
+          </div>
+        </div>
+
+        {/* Right panel: comments */}
+        <div>
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-base font-semibold">
+              Discussion
+              <span className="ml-2 text-sm font-normal text-[var(--muted-foreground)]">
+                ({story.descendants ?? 0} comments)
+              </span>
+            </h2>
+          </div>
+          <Suspense fallback={<Loader2 className="size-5 animate-spin text-[var(--muted-foreground)]" />}>
+            <CommentThread comments={comments} totalCount={story.descendants ?? 0} />
+          </Suspense>
+        </div>
+      </div>
+    </div>
+  )
+}
