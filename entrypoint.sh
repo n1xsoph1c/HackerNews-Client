@@ -1,8 +1,8 @@
 #!/bin/sh
 set -e
 
-echo "==> Running database migrations..."
-npx prisma migrate deploy
+echo "==> Syncing database schema..."
+npx prisma db push --accept-data-loss
 
 echo "==> Pre-pulling Ollama model: ${OLLAMA_MODEL:-llama3.2:3b}"
 # Pull in background — app starts immediately, model downloads in background

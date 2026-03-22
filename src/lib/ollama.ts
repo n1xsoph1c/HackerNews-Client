@@ -33,7 +33,7 @@ Comments:
 ${commentsText}`
 }
 
-export function flattenComments(comments: { by?: string; text?: string; children?: unknown[] }[], maxChars = 8000): string {
+export function flattenComments(comments: { by?: string; text?: string; children?: unknown[] }[], maxChars = 1500): string {
   const lines: string[] = []
   let total = 0
 
