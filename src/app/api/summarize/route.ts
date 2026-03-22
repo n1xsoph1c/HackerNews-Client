@@ -82,7 +82,19 @@ export async function POST(request: NextRequest) {
         try {
           const jsonMatch = fullText.match(/\{[\s\S]*\}/)
           if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0])
+            let parsed = JSON.parse(jsonMatch[0])
+            // Small models sometimes wrap the full JSON inside the "overview" field.
+            // Detect and unwrap: if overview is itself a valid JSON object, use that.
+            if (
+              parsed.overview &&
+              typeof parsed.overview === "string" &&
+              parsed.overview.trim().startsWith("{")
+            ) {
+              try {
+                const inner = JSON.parse(parsed.overview)
+                if (inner.insights || inner.worth_reading) parsed = inner
+              } catch { /* not double-encoded — keep original */ }
+            }
 
             // Resolve worth_reading comment IDs server-side
             const worthReadingRaw: WorthReadingRaw[] = parsed.worth_reading ?? []

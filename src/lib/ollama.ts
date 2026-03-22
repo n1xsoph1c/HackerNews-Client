@@ -115,6 +115,7 @@ Respond ONLY with valid JSON in this exact format:
 }
 
 Rules:
+- Output ONLY the JSON object. No preamble, no explanation, no markdown code fences.
 - insights: 4-7 items, most important first
 - worth_reading: 2-4 real authors with real text (not synthesized — must exist in comments below)
 - preview MUST be exact text from the comments — it is used for navigation
