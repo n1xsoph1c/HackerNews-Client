@@ -46,7 +46,5 @@ yarn-error.log*
 prisma/*.db
 prisma/*.db-journal
 
-# README (tracked separately outside git)
-README.md
 
 /src/generated/prisma
