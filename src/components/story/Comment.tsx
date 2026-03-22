@@ -1,7 +1,7 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
 import { timeAgo } from '@/lib/time'
 import { HNComment } from '@/lib/hn-api'
 
@@ -19,13 +19,54 @@ type Props = {
 
 export function Comment({ comment, isDesktop = false }: Props) {
   const [expanded, setExpanded] = useState(comment.depth < 2)
-  const depthColor = DEPTH_COLORS[Math.min(comment.depth, 3)]
-  const hasReplies = comment.children && comment.children.length > 0
+  const [loadedChildren, setLoadedChildren] = useState<HNComment[]>(comment.children ?? [])
+  const [loadingReplies, setLoadingReplies] = useState(false)
+  const abortRef = useRef<AbortController | null>(null)
 
-  if (!comment.text && !hasReplies) return null
+  const depthColor = DEPTH_COLORS[Math.min(comment.depth, 3)]
+  // True when kids exist on HN but haven't been fetched yet
+  const hasUnloaded = (comment.kids?.length ?? 0) > 0 && loadedChildren.length === 0
+  const hasReplies = loadedChildren.length > 0
+  // Total reply count — show before loading
+  const replyCount = hasReplies ? loadedChildren.length : (comment.kids?.length ?? 0)
+
+  async function loadReplies() {
+    if (loadingReplies || !hasUnloaded) return
+    setLoadingReplies(true)
+    abortRef.current = new AbortController()
+    try {
+      const res = await fetch(`/api/comments/${comment.id}/replies`, {
+        signal: abortRef.current.signal,
+      })
+      const { replies } = await res.json()
+      setLoadedChildren(replies)
+    } catch {
+      // AbortError on unmount or network error — silently ignore
+    } finally {
+      setLoadingReplies(false)
+    }
+  }
+
+  // Auto-load replies for depth < 2 (preserves current UX where shallow comments auto-expand)
+  useEffect(() => {
+    if (comment.depth < 2 && hasUnloaded) {
+      loadReplies()
+    }
+    return () => abortRef.current?.abort()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function handleExpand() {
+    if (hasUnloaded) await loadReplies()
+    setExpanded(e => !e)
+  }
+
+  if (!comment.text && !hasReplies && !hasUnloaded) return null
+
+  const showToggle = replyCount > 0
 
   return (
-    <div className={isDesktop ? 'relative' : ''}>
+    <div id={`comment-${comment.id}`} className={isDesktop ? 'relative' : ''}>
       <div
         className={`pl-3 border-l-2 ${depthColor} ${comment.depth > 0 ? (isDesktop ? 'ml-6' : 'ml-3') : ''}`}
       >
@@ -33,13 +74,19 @@ export function Comment({ comment, isDesktop = false }: Props) {
         <div className="flex items-center gap-2 mb-1.5">
           <span className="text-xs font-medium text-brand">{comment.by ?? '[deleted]'}</span>
           <span className="text-xs text-[var(--muted-foreground)]">{timeAgo(comment.time)}</span>
-          {hasReplies && (
+          {showToggle && (
             <button
-              onClick={() => setExpanded(e => !e)}
+              onClick={handleExpand}
               className="ml-auto flex items-center gap-0.5 text-xs text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
             >
-              {expanded ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-              <span>{comment.children.length} {comment.children.length === 1 ? 'reply' : 'replies'}</span>
+              {loadingReplies ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : expanded ? (
+                <ChevronDown className="size-3" />
+              ) : (
+                <ChevronRight className="size-3" />
+              )}
+              <span>{replyCount} {replyCount === 1 ? 'reply' : 'replies'}</span>
             </button>
           )}
         </div>
@@ -62,7 +109,7 @@ export function Comment({ comment, isDesktop = false }: Props) {
               transition={{ duration: 0.15 }}
               className="overflow-hidden space-y-3 mt-3"
             >
-              {comment.children.map(child => (
+              {loadedChildren.map(child => (
                 <Comment key={child.id} comment={child} isDesktop={isDesktop} />
               ))}
             </motion.div>

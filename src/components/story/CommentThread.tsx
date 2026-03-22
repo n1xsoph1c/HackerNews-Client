@@ -5,9 +5,10 @@ import { MessageSquare } from 'lucide-react'
 type Props = {
   comments: HNComment[]
   totalCount: number
+  isDesktop?: boolean
 }
 
-export function CommentThread({ comments, totalCount }: Props) {
+export function CommentThread({ comments, totalCount, isDesktop = false }: Props) {
   if (comments.length === 0) {
     return (
       <div className="flex flex-col items-center gap-2 py-12 text-[var(--muted-foreground)]">
@@ -20,12 +21,12 @@ export function CommentThread({ comments, totalCount }: Props) {
   return (
     <div>
       <p className="text-xs text-[var(--muted-foreground)] mb-4">
-        Showing {comments.length} of {totalCount} comments
+        Showing {comments.length} of {totalCount} top-level comments
       </p>
       <div className="space-y-4">
         {comments.map(comment => (
           <div key={comment.id} className="pb-4 border-b border-[var(--border-color)] last:border-0">
-            <Comment comment={comment} isDesktop={false} />
+            <Comment comment={comment} isDesktop={isDesktop} />
           </div>
         ))}
       </div>

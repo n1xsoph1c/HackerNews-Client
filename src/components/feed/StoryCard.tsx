@@ -16,7 +16,10 @@ export function StoryCard({ story, isBookmarked, onBookmark, showRemove, onRemov
   const domain = getDomain(story.url)
 
   return (
-    <div className="group p-4 bg-[var(--card-bg)] border border-[var(--border-color)] rounded-xl hover:border-[var(--surface-hover)] hover:bg-[var(--surface)] transition-all duration-200">
+    <div
+      className="group p-4 bg-[var(--card-bg)] border border-[var(--border-color)] rounded-xl hover:border-[var(--surface-hover)] hover:bg-[var(--surface)] transition-all duration-200"
+      onMouseEnter={() => fetch(`/api/stories/${story.id}`).catch(() => {})}
+    >
       {/* Source domain */}
       {domain && (
         <div className="text-xs text-[var(--muted-foreground)] mb-1.5 flex items-center gap-1">

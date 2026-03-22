@@ -1,26 +1,95 @@
 'use client'
 import { useState } from 'react'
-import { Sparkles, Loader2, ChevronDown, ChevronUp } from 'lucide-react'
+import {
+  Sparkles, Loader2, ChevronDown, ChevronUp,
+  Info, MessageSquare, AlertTriangle, Lightbulb, ArrowLeftRight,
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SentimentBadge } from './SentimentBadge'
 import { motion, AnimatePresence } from 'motion/react'
+import { toast } from 'sonner'
+
+type InsightType = 'fact' | 'debate' | 'warning' | 'tip' | 'counterpoint'
+
+type Insight = {
+  title: string
+  detail: string
+  author: string | null
+  type: InsightType
+}
+
+type WorthReading = {
+  author: string
+  preview: string
+  why: string
+  commentId: number | null
+}
 
 type SummaryState = {
   streaming: boolean
   streamedText: string
-  keyPoints: string[]
+  // Rich fields
+  overview: string
+  insights: Insight[]
+  worthReading: WorthReading[]
+  verdict: string
   sentiment: string
+  // Legacy fallback
+  keyPoints: string[]
   summary: string
   done: boolean
   error: string | null
 }
 
-export function SummarizeButton({ storyId }: { storyId: number }) {
+const INSIGHT_ICONS: Record<InsightType, React.ReactNode> = {
+  fact:         <Info className="size-3.5 shrink-0 text-blue-500" />,
+  debate:       <MessageSquare className="size-3.5 shrink-0 text-amber-500" />,
+  warning:      <AlertTriangle className="size-3.5 shrink-0 text-red-500" />,
+  tip:          <Lightbulb className="size-3.5 shrink-0 text-green-500" />,
+  counterpoint: <ArrowLeftRight className="size-3.5 shrink-0 text-purple-500" />,
+}
+
+const INSIGHT_BORDER: Record<InsightType, string> = {
+  fact:         'border-l-blue-500/60',
+  debate:       'border-l-amber-500/60',
+  warning:      'border-l-red-500/60',
+  tip:          'border-l-green-500/60',
+  counterpoint: 'border-l-purple-500/60',
+}
+
+function scrollToComment(commentId: number | null) {
+  if (!commentId) {
+    toast('Expand parent comments to find this one')
+    return
+  }
+  const el = document.getElementById(`comment-${commentId}`)
+  if (!el) {
+    toast('Comment not visible — scroll down or expand replies')
+    return
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  el.classList.add('ring-2', 'ring-offset-1', 'ring-[var(--color-brand)]', 'rounded-lg')
+  setTimeout(() => {
+    el.classList.remove('ring-2', 'ring-offset-1', 'ring-[var(--color-brand)]', 'rounded-lg')
+  }, 2000)
+}
+
+export function SummarizeButton({
+  storyId,
+  storyTitle,
+}: {
+  storyId: number
+  storyTitle: string
+}) {
   const [state, setState] = useState<SummaryState>({
     streaming: false,
     streamedText: '',
-    keyPoints: [],
+    overview: '',
+    insights: [],
+    worthReading: [],
+    verdict: '',
     sentiment: '',
+    keyPoints: [],
     summary: '',
     done: false,
     error: null,
@@ -35,7 +104,7 @@ export function SummarizeButton({ storyId }: { storyId: number }) {
       const res = await fetch('/api/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ storyId }),
+        body: JSON.stringify({ storyId, storyTitle }),
       })
 
       if (!res.ok || !res.body) {
@@ -62,10 +131,14 @@ export function SummarizeButton({ storyId }: { storyId: number }) {
                 ...s,
                 streaming: false,
                 done: true,
-                keyPoints: data.keyPoints ?? [],
-                sentiment: data.sentiment ?? 'neutral',
-                summary: data.summary ?? s.streamedText,
                 streamedText: '',
+                overview: data.overview ?? '',
+                insights: data.insights ?? [],
+                worthReading: data.worthReading ?? [],
+                verdict: data.verdict ?? '',
+                sentiment: data.sentiment ?? 'neutral',
+                keyPoints: data.keyPoints ?? [],
+                summary: data.summary ?? '',
               }))
             } else if (data.type === 'error') {
               setState(s => ({ ...s, streaming: false, error: data.message }))
@@ -78,7 +151,11 @@ export function SummarizeButton({ storyId }: { storyId: number }) {
     }
   }
 
-  const { streaming, streamedText, keyPoints, sentiment, summary, done, error } = state
+  const { streaming, streamedText, overview, insights, worthReading, verdict, sentiment,
+          keyPoints, summary, done, error } = state
+
+  // Detect old-format summary (no overview — legacy cached result)
+  const isLegacyFormat = done && !overview && (keyPoints.length > 0 || summary)
 
   return (
     <div className="space-y-3">
@@ -96,7 +173,10 @@ export function SummarizeButton({ storyId }: { storyId: number }) {
           )}
         </Button>
         {done && (
-          <button onClick={() => setOpen(o => !o)} className="text-[var(--muted-foreground)] hover:text-[var(--foreground)]">
+          <button
+            onClick={() => setOpen(o => !o)}
+            className="text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+          >
             {open ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
           </button>
         )}
@@ -111,7 +191,8 @@ export function SummarizeButton({ storyId }: { storyId: number }) {
             transition={{ duration: 0.2 }}
             className="overflow-hidden"
           >
-            <div className="p-4 rounded-xl bg-[var(--surface)] border border-[var(--border-color)] space-y-3">
+            <div className="p-4 rounded-xl bg-[var(--surface)] border border-[var(--border-color)] space-y-4">
+
               {/* Streaming raw text */}
               {streaming && streamedText && (
                 <p className="text-sm text-[var(--muted-foreground)] font-mono leading-relaxed whitespace-pre-wrap">
@@ -120,20 +201,106 @@ export function SummarizeButton({ storyId }: { storyId: number }) {
                 </p>
               )}
 
-              {/* Loading state */}
+              {/* Waiting for first token */}
               {streaming && !streamedText && (
                 <div className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
                   <Loader2 className="size-3.5 animate-spin" />
-                  <span>Generating summary...</span>
+                  <span>Analyzing discussion...</span>
                 </div>
               )}
 
-              {/* Complete result */}
-              {done && (
-                <div className="space-y-3">
-                  <div className="flex items-center gap-2">
-                    <SentimentBadge sentiment={sentiment} />
+              {/* Rich summary result */}
+              {done && !isLegacyFormat && (
+                <div className="space-y-4">
+                  {/* Sentiment + overview */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <SentimentBadge sentiment={sentiment} />
+                    </div>
+                    {overview && (
+                      <p className="text-sm text-[var(--foreground)] leading-relaxed">{overview}</p>
+                    )}
                   </div>
+
+                  {/* Insights */}
+                  {insights.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">
+                        Key Insights
+                      </p>
+                      <div className="space-y-2">
+                        {insights.map((insight, i) => {
+                          const type = (insight.type ?? 'fact') as InsightType
+                          return (
+                            <div
+                              key={i}
+                              className={`pl-3 border-l-2 ${INSIGHT_BORDER[type] ?? 'border-l-blue-500/60'} space-y-0.5`}
+                            >
+                              <div className="flex items-center gap-1.5">
+                                {INSIGHT_ICONS[type] ?? INSIGHT_ICONS.fact}
+                                <span className="text-xs font-semibold text-[var(--foreground)]">
+                                  {insight.title}
+                                </span>
+                                {insight.author && (
+                                  <span className="text-xs text-brand ml-auto shrink-0">
+                                    @{insight.author}
+                                  </span>
+                                )}
+                              </div>
+                              {insight.detail && (
+                                <p className="text-xs text-[var(--muted-foreground)] leading-relaxed">
+                                  {insight.detail}
+                                </p>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Worth reading — clickable chips that scroll to comments */}
+                  {worthReading.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">
+                        Worth Reading
+                      </p>
+                      <div className="space-y-1.5">
+                        {worthReading.map((wr, i) => (
+                          <button
+                            key={i}
+                            onClick={() => scrollToComment(wr.commentId)}
+                            className="w-full text-left p-2.5 rounded-lg border border-[var(--border-color)]
+                                       hover:border-brand hover:bg-brand/5 transition-colors group"
+                          >
+                            <div className="flex items-baseline gap-1.5 mb-0.5">
+                              <span className="text-xs font-medium text-brand shrink-0">
+                                @{wr.author}
+                              </span>
+                              <span className="text-xs text-[var(--muted-foreground)] truncate italic">
+                                &ldquo;{wr.preview}&hellip;&rdquo;
+                              </span>
+                            </div>
+                            <p className="text-xs text-[var(--foreground)] leading-snug">{wr.why}</p>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Verdict */}
+                  {verdict && (
+                    <p className="text-xs text-[var(--muted-foreground)] italic border-t border-[var(--border-color)] pt-3 leading-relaxed">
+                      {verdict}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Legacy format fallback (old cached summaries) */}
+              {isLegacyFormat && (
+                <div className="space-y-3">
+                  <SentimentBadge sentiment={sentiment} />
                   {keyPoints.length > 0 && (
                     <ul className="space-y-1">
                       {keyPoints.map((point, i) => (

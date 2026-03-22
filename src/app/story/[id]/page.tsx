@@ -1,6 +1,7 @@
 import { Suspense } from 'react'
 import { notFound } from 'next/navigation'
-import { fetchStoryWithComments } from '@/lib/hn-api'
+import { fetchStoryShallow } from '@/lib/hn-api'
+import { getCachedStory, setCachedStory } from '@/lib/story-cache'
 import { StoryHeader } from '@/components/story/StoryHeader'
 import { SummarizeButton } from '@/components/story/SummarizeButton'
 import { CommentThread } from '@/components/story/CommentThread'
@@ -14,14 +15,21 @@ export default async function StoryPage({
   const { id } = await params
   const storyId = parseInt(id, 10)
 
-  const data = await fetchStoryWithComments(storyId).catch(() => null)
+  // Check cache first for instant repeat visits
+  const cached = await getCachedStory(storyId)
+  let story, comments
 
-  if (!data) notFound()
-
-  const { story, comments } = data
-
-  function countAll(items: typeof comments): number {
-    return items.reduce((sum, c) => sum + 1 + countAll(c.children), 0)
+  if (cached) {
+    story = cached.story
+    comments = cached.comments
+  } else {
+    // Cache miss — fetch shallow (depth=0 only, fast)
+    const data = await fetchStoryShallow(storyId).catch(() => null)
+    if (!data) notFound()
+    story = data.story
+    comments = data.comments
+    // Cache in background — don't await so page renders ASAP
+    setCachedStory(storyId, story, comments).catch(console.error)
   }
 
   return (
@@ -29,7 +37,7 @@ export default async function StoryPage({
       {/* Mobile: stacked layout */}
       <div className="md:hidden space-y-6">
         <StoryHeader story={story} />
-        <SummarizeButton storyId={storyId} />
+        <SummarizeButton storyId={storyId} storyTitle={story.title} />
         <div>
           <h2 className="text-sm font-semibold text-[var(--muted-foreground)] uppercase tracking-wider mb-4">
             Discussion
@@ -49,7 +57,7 @@ export default async function StoryPage({
             <p className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider mb-3">
               AI Summary
             </p>
-            <SummarizeButton storyId={storyId} />
+            <SummarizeButton storyId={storyId} storyTitle={story.title} />
           </div>
         </div>
 
@@ -64,7 +72,7 @@ export default async function StoryPage({
             </h2>
           </div>
           <Suspense fallback={<Loader2 className="size-5 animate-spin text-[var(--muted-foreground)]" />}>
-            <CommentThread comments={comments} totalCount={story.descendants ?? 0} />
+            <CommentThread comments={comments} totalCount={story.descendants ?? 0} isDesktop />
           </Suspense>
         </div>
       </div>

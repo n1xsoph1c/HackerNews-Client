@@ -1,12 +1,21 @@
 import { NextRequest } from "next/server"
 import { db } from "@/lib/db"
-import { getActiveModel, getOllamaClient, buildSummaryPrompt, flattenComments } from "@/lib/ollama"
+import {
+  getActiveModel,
+  getOllamaClient,
+  buildRichSummaryPrompt,
+  selectCommentsForSummary,
+  findCommentId,
+} from "@/lib/ollama"
 import { fetchStoryWithComments } from "@/lib/hn-api"
 
 export const maxDuration = 300
 
+type WorthReadingRaw = { author: string; preview: string; why: string }
+
 export async function POST(request: NextRequest) {
-  const { storyId } = await request.json()
+  const body = await request.json()
+  const { storyId, storyTitle } = body
 
   if (!storyId) {
     return new Response("Missing storyId", { status: 400 })
@@ -14,15 +23,21 @@ export async function POST(request: NextRequest) {
 
   const model = await getActiveModel()
 
-  // Return cached summary if exists for same model
+  // Return cached summary if it exists for the same model AND has rich fields
   const cached = await db.summary.findUnique({ where: { storyId } })
-  if (cached && cached.model === model) {
+  if (cached && cached.model === model && cached.overview !== null) {
     const data = JSON.stringify({
       type: "complete",
-      keyPoints: cached.keyPoints,
-      sentiment: cached.sentiment,
-      summary: cached.summary,
       cached: true,
+      // Rich fields
+      overview: cached.overview,
+      insights: cached.insights,
+      worthReading: cached.worthReading,
+      verdict: cached.verdict,
+      sentiment: cached.sentiment,
+      // Legacy fallback fields
+      keyPoints: cached.keyPoints,
+      summary: cached.summary,
     })
     return new Response(`data: ${data}\n\n`, {
       headers: {
@@ -33,14 +48,15 @@ export async function POST(request: NextRequest) {
     })
   }
 
-  // Fetch comments
+  // Fetch full comment tree for summarization (needed for smart sampling + ID resolution)
   const storyData = await fetchStoryWithComments(storyId)
   if (!storyData) {
     return new Response("Story not found", { status: 404 })
   }
 
-  const commentsText = flattenComments(storyData.comments)
-  const prompt = buildSummaryPrompt(commentsText)
+  const title = storyTitle || storyData.story.title
+  const commentsText = selectCommentsForSummary(storyData.comments, model)
+  const prompt = buildRichSummaryPrompt(commentsText, title)
   const ollama = getOllamaClient()
 
   const encoder = new TextEncoder()
@@ -62,33 +78,71 @@ export async function POST(request: NextRequest) {
           controller.enqueue(encoder.encode(event))
         }
 
-        // Parse and cache the final JSON result
+        // Parse and cache
         try {
           const jsonMatch = fullText.match(/\{[\s\S]*\}/)
           if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0])
+
+            // Resolve worth_reading comment IDs server-side
+            const worthReadingRaw: WorthReadingRaw[] = parsed.worth_reading ?? []
+            const worthReading = worthReadingRaw.map((wr) => ({
+              ...wr,
+              commentId: findCommentId(storyData.comments, wr.author, wr.preview),
+            }))
+
+            // Legacy keyPoints from insights titles for backward compat
+            const keyPoints = (parsed.insights ?? []).map((i: { title: string }) => i.title)
+
             await db.summary.upsert({
               where: { storyId },
               update: {
-                keyPoints: parsed.keyPoints ?? [],
+                overview: parsed.overview ?? "",
+                insights: parsed.insights ?? [],
+                worthReading,
+                verdict: parsed.verdict ?? "",
                 sentiment: parsed.sentiment ?? "neutral",
-                summary: parsed.summary ?? "",
+                keyPoints,
+                summary: parsed.overview ?? "",
                 model,
               },
               create: {
                 storyId,
-                keyPoints: parsed.keyPoints ?? [],
+                overview: parsed.overview ?? "",
+                insights: parsed.insights ?? [],
+                worthReading,
+                verdict: parsed.verdict ?? "",
                 sentiment: parsed.sentiment ?? "neutral",
-                summary: parsed.summary ?? "",
+                keyPoints,
+                summary: parsed.overview ?? "",
                 model,
               },
             })
-            const doneEvent = `data: ${JSON.stringify({ type: "complete", ...parsed })}\n\n`
+
+            const doneEvent = `data: ${JSON.stringify({
+              type: "complete",
+              overview: parsed.overview,
+              insights: parsed.insights,
+              worthReading,
+              verdict: parsed.verdict,
+              sentiment: parsed.sentiment,
+              keyPoints,
+              summary: parsed.overview,
+            })}\n\n`
             controller.enqueue(encoder.encode(doneEvent))
           }
         } catch {
-          // If JSON parse fails, send raw text
-          const doneEvent = `data: ${JSON.stringify({ type: "complete", summary: fullText, keyPoints: [], sentiment: "neutral" })}\n\n`
+          // JSON parse failed — send raw text as fallback
+          const doneEvent = `data: ${JSON.stringify({
+            type: "complete",
+            overview: fullText,
+            insights: [],
+            worthReading: [],
+            verdict: "",
+            sentiment: "neutral",
+            keyPoints: [],
+            summary: fullText,
+          })}\n\n`
           controller.enqueue(encoder.encode(doneEvent))
         }
       } catch (err) {

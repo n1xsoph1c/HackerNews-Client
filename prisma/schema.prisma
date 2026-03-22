@@ -20,13 +20,27 @@ model Bookmark {
 }
 
 model Summary {
-  id        Int      @id @default(autoincrement())
-  storyId   Int      @unique
-  keyPoints String[]
-  sentiment String
-  summary   String
-  model     String
-  createdAt DateTime @default(now())
+  id           Int      @id @default(autoincrement())
+  storyId      Int      @unique
+  // Legacy fields — kept for old cached rows
+  keyPoints    String[]
+  sentiment    String
+  summary      String
+  // Rich fields — null means old format, triggers re-generation on next request
+  overview     String?
+  insights     Json?
+  worthReading Json?
+  verdict      String?
+  model        String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @default(now()) @updatedAt
+}
+
+model StoryCache {
+  storyId      Int      @id
+  storyJson    Json
+  commentsJson Json
+  fetchedAt    DateTime @default(now())
 }
 
 model Setting {

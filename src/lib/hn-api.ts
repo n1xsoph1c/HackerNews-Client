@@ -142,3 +142,67 @@ export async function fetchStoryWithComments(
 
   return { story, comments }
 }
+
+// Fetches only top-level (depth=0) comments — ~20-50 API calls vs 150+ for full tree.
+// Each comment has its original kids[] preserved but children: [] (unloaded placeholder).
+export async function fetchStoryShallow(
+  id: number
+): Promise<{ story: HNStory; comments: HNComment[] } | null> {
+  const item = await fetchItem(id)
+  if (!item || !("title" in item)) return null
+
+  const story = item as HNStory
+  if (!story.kids || story.kids.length === 0) return { story, comments: [] }
+
+  const rawItems = await Promise.all(story.kids.slice(0, 50).map(fetchItem))
+  const comments: HNComment[] = []
+
+  for (const raw of rawItems) {
+    if (!raw) continue
+    const r = raw as Record<string, unknown>
+    if (r.dead || r.deleted || !r.by) continue
+    comments.push({
+      id: r.id as number,
+      by: r.by as string,
+      text: r.text as string | undefined,
+      time: r.time as number,
+      kids: r.kids as number[] | undefined,
+      children: [],
+      depth: 0,
+    })
+  }
+
+  return { story, comments }
+}
+
+// Fetches immediate children of a single comment (one level deep).
+// Each child has its own kids[] preserved but children: [] for further lazy loading.
+export async function fetchCommentReplies(commentId: number): Promise<HNComment[]> {
+  const item = await fetchItem(commentId)
+  if (!item) return []
+
+  const r = item as Record<string, unknown>
+  const kids = r.kids as number[] | undefined
+  if (!kids || kids.length === 0) return []
+
+  const parentDepth = (r.depth as number | undefined) ?? 0
+  const rawItems = await Promise.all(kids.slice(0, 30).map(fetchItem))
+  const replies: HNComment[] = []
+
+  for (const raw of rawItems) {
+    if (!raw) continue
+    const c = raw as Record<string, unknown>
+    if (c.dead || c.deleted || !c.by) continue
+    replies.push({
+      id: c.id as number,
+      by: c.by as string,
+      text: c.text as string | undefined,
+      time: c.time as number,
+      kids: c.kids as number[] | undefined,
+      children: [],
+      depth: parentDepth + 1,
+    })
+  }
+
+  return replies
+}
