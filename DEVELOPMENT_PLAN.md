@@ -237,10 +237,25 @@ className="text-brand bg-brand/10"
 
 | Phase | Status |
 |-------|--------|
-| 1 — Project Setup | 🔄 In progress (docs done, scaffold pending) |
-| 2 — Database + Docker | ⬜ Pending |
-| 3 — Backend | ⬜ Pending |
-| 4 — Frontend | ⬜ Pending |
-| 5 — Polish + README | ⬜ Pending |
+| 1 — Project Setup | ✅ Complete |
+| 2 — Database + Docker | ✅ Complete |
+| 3 — Backend | ✅ Complete |
+| 4 — Frontend | ✅ Complete |
+| 5 — Polish + README | ⬜ Pending (README excluded from git per instructions) |
 
-**Last updated:** Phase 1.1 complete (CLAUDE.md + DEVELOPMENT_PLAN.md + .gitignore created)
+**Last updated:** All phases complete. Build passes (`npm run build` — 0 errors). Ready for `docker compose up --build`.
+
+### Important Prisma 7 Notes (discovered during implementation)
+- `prisma-client` generator requires `output` path in schema.prisma
+- `datasource url` is NOT in schema.prisma — URL goes to PrismaClient constructor via `@prisma/adapter-pg`
+- Import from `@/generated/prisma/client` (not `@prisma/client`)
+- Run `npx prisma generate` after any schema changes
+
+### Key files
+- `src/lib/db.ts` — Prisma singleton with PrismaPg adapter
+- `src/lib/hn-api.ts` — HN fetcher (Semaphore, BFS comments)
+- `src/lib/ollama.ts` — Ollama client, prompt builder
+- `src/app/api/summarize/route.ts` — SSE AI summary (maxDuration=300)
+- `src/app/api/ollama/pull/route.ts` — SSE model pull (maxDuration=1800)
+- `src/components/story/SummarizeButton.tsx` — SSE consumer
+- `src/components/models/PullProgress.tsx` — pull progress SSE consumer
