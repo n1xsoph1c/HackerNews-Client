@@ -298,27 +298,3 @@ OLLAMA_MEMORY_LIMIT=8G     # Memory limit (e.g., 4G, 8G)
 
 ---
 
-## Troubleshooting
-
-### Summarize gets stuck at "fetching discussion 0/?"
-**Cause**: Race condition when background pre-summarization and user-initiated summarize run concurrently.
-
-**Fix**: The API now checks if Ollama is busy and waits for any background job to complete before starting a new one. This prevents two concurrent Ollama calls that would overload the model.
-
-### Ollama shows 100% CPU usage
-**Cause**: Multiple simultaneous summarization requests (background pre-gen + user click).
-
-**Fix**: The `ollamaBusy` flag is now checked before starting new requests. Use the Resource Limits settings to cap Ollama's resource usage.
-
-### Pulling indicator keeps reappearing on Models page
-**Cause**: Auto-pull triggers on every page refresh, not just initial mount.
-
-**Fix**: Auto-pull now only triggers on initial page load and tracks the pulling state to prevent re-triggering during refresh.
-
-### GPU Setup Notes
-For GPU acceleration, use the GPU override:
-```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
-```
-
-The GPU compose file sets default resource limits (4 cores, 8GB memory) which can be overridden via environment variables.
