@@ -284,47 +284,60 @@ export function SummarizeButton({
 
               {/* Streaming state — phase-aware with progressive reveal */}
               {streaming && (
-                <div className="space-y-3">
+                <div className="space-y-4">
                   {/* Status indicator */}
                   {phase === 'fetching' && (() => {
                     const pct = totalComments > 0 ? Math.round((fetchedComments / totalComments) * 100) : 0
-                    const filled = Math.round(pct / 5)
-                    const bar = '█'.repeat(filled) + '░'.repeat(20 - filled)
                     return (
-                      <div className="space-y-1.5">
+                      <div className="space-y-2">
                         <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
-                          <Loader2 className="size-3 animate-spin shrink-0" />
-                          <span>{round === 2 ? 'Fetching replies…' : 'Fetching discussion…'}</span>
+                          <Loader2 className="size-3.5 animate-spin shrink-0" />
+                          <span className="font-medium">{round === 2 ? 'Fetching replies…' : 'Fetching discussion…'}</span>
                           <span className="ml-auto text-[var(--muted-foreground)]/60">pass {round}/2</span>
                         </div>
-                        <div className="font-mono text-xs text-[var(--muted-foreground)] tracking-tight">
-                          [{bar}] {fetchedComments}/{totalComments > 0 ? totalComments : '?'}
+                        <div className="h-2 bg-[var(--muted)] rounded-full overflow-hidden">
+                          <motion.div
+                            className="h-full bg-brand rounded-full"
+                            initial={{ width: '0%' }}
+                            animate={{ width: `${pct}%` }}
+                            transition={{ duration: 0.3 }}
+                          />
+                        </div>
+                        <div className="flex justify-between text-xs text-[var(--muted-foreground)]">
+                          <span>{fetchedComments} of {totalComments > 0 ? totalComments : '?'} comments</span>
+                          <span>{pct}%</span>
                         </div>
                       </div>
                     )
                   })()}
 
                   {phase === 'thinking' && (
-                    <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
-                      <Loader2 className="size-3 animate-spin shrink-0" />
-                      <span>
-                        {round === 2
-                          ? 'Refining with replies…'
-                          : streamedText
-                          ? 'Building summary…'
-                          : isReasoning
-                          ? 'Model reasoning…'
-                          : 'Analyzing comments…'}
-                      </span>
-                      {round === 2 && <span className="ml-auto text-[var(--muted-foreground)]/60">pass 2/2</span>}
-                      {isReasoning && round !== 2 && (
-                        <span className="flex gap-0.5">
-                          {[0, 1, 2].map(i => (
-                            <span key={i} className="inline-block w-1 h-1 rounded-full bg-amber-500 animate-pulse"
-                              style={{ animationDelay: `${i * 150}ms` }} />
-                          ))}
-                        </span>
-                      )}
+                    <div className="flex items-center gap-3">
+                      <Loader2 className="size-4 animate-spin shrink-0 text-brand" />
+                      <div className="flex-1">
+                        <p className="text-xs font-medium text-[var(--foreground)]">
+                          {round === 2
+                            ? 'Refining with replies…'
+                            : streamedText
+                            ? 'Building summary…'
+                            : isReasoning
+                            ? 'Model reasoning…'
+                            : 'Analyzing comments…'}
+                        </p>
+                        {isReasoning && (
+                          <div className="flex gap-1 mt-1.5">
+                            {[0, 1, 2, 3, 4].map(i => (
+                              <motion.span
+                                key={i}
+                                className="w-1.5 h-1.5 rounded-full bg-amber-500"
+                                animate={{ opacity: [0.3, 1, 0.3] }}
+                                transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.1 }}
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <span className="text-xs text-[var(--muted-foreground)]/60">pass {round}/2</span>
                     </div>
                   )}
 
@@ -334,6 +347,24 @@ export function SummarizeButton({
                       <Loader2 className="size-3 animate-spin shrink-0" />
                       <span>Preparing second pass…</span>
                     </div>
+                  )}
+
+                  {/* Streaming overview text */}
+                  {streamedText && phase === 'thinking' && (
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className="p-3 rounded-lg bg-[var(--muted)]/50 border border-[var(--border-color)]"
+                    >
+                      <p className="text-xs text-[var(--muted-foreground)] mb-1.5 font-medium">
+                        Generating preview…
+                      </p>
+                      <p className="text-sm text-[var(--foreground)] leading-relaxed font-mono">
+                        {streamedText.length > 300 
+                          ? streamedText.slice(0, 300) + '…' 
+                          : streamedText}
+                      </p>
+                    </motion.div>
                   )}
 
                   {/* Overview — progressive (round 1) or stable from roundComplete (round 2) */}
