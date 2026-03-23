@@ -25,8 +25,14 @@ type WorthReading = {
   commentId: number | null
 }
 
+type Phase = 'idle' | 'fetching' | 'thinking'
+
 type SummaryState = {
   streaming: boolean
+  phase: Phase
+  isReasoning: boolean
+  fetchedComments: number
+  totalComments: number
   streamedText: string
   // Rich fields
   overview: string
@@ -59,19 +65,29 @@ const INSIGHT_BORDER: Record<InsightType, string> = {
 
 function scrollToComment(commentId: number | null) {
   if (!commentId) {
-    toast('Expand parent comments to find this one')
+    toast('Comment not found in loaded thread')
     return
   }
-  const el = document.getElementById(`comment-${commentId}`)
-  if (!el) {
-    toast('Comment not visible — scroll down or expand replies')
-    return
-  }
-  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  el.classList.add('ring-2', 'ring-offset-1', 'ring-[var(--color-brand)]', 'rounded-lg')
-  setTimeout(() => {
-    el.classList.remove('ring-2', 'ring-offset-1', 'ring-[var(--color-brand)]', 'rounded-lg')
-  }, 2000)
+
+  // Fire event so collapsed ancestor Comments auto-expand
+  window.dispatchEvent(new CustomEvent('hn:reveal-comment', { detail: { id: commentId } }))
+
+  // Poll for element (expansion + reply loading is async)
+  let attempts = 0
+  const interval = setInterval(() => {
+    const el = document.getElementById(`comment-${commentId}`)
+    if (el) {
+      clearInterval(interval)
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el.classList.add('ring-2', 'ring-offset-1', 'ring-[var(--color-brand)]', 'rounded-lg')
+      setTimeout(() => {
+        el.classList.remove('ring-2', 'ring-offset-1', 'ring-[var(--color-brand)]', 'rounded-lg')
+      }, 2000)
+    } else if (++attempts > 15) {
+      clearInterval(interval)
+      toast('Comment not visible — it may be beyond the loaded depth')
+    }
+  }, 200)
 }
 
 export function SummarizeButton({
@@ -83,6 +99,10 @@ export function SummarizeButton({
 }) {
   const [state, setState] = useState<SummaryState>({
     streaming: false,
+    phase: 'idle',
+    isReasoning: false,
+    fetchedComments: 0,
+    totalComments: 0,
     streamedText: '',
     overview: '',
     insights: [],
@@ -121,7 +141,7 @@ export function SummarizeButton({
   }, [state.streamedText]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function summarize() {
-    setState(s => ({ ...s, streaming: true, streamedText: '', done: false, error: null }))
+    setState(s => ({ ...s, streaming: true, phase: 'fetching', isReasoning: false, fetchedComments: 0, totalComments: 0, streamedText: '', overview: '', insights: [], worthReading: [], verdict: '', sentiment: '', done: false, error: null }))
     setOpen(true)
 
     try {
@@ -148,12 +168,19 @@ export function SummarizeButton({
         for (const line of lines) {
           try {
             const data = JSON.parse(line.slice(6))
-            if (data.type === 'token') {
-              setState(s => ({ ...s, streamedText: s.streamedText + data.token }))
+            if (data.type === 'phase') {
+              setState(s => ({ ...s, phase: data.phase as Phase }))
+            } else if (data.type === 'reasoning') {
+              setState(s => ({ ...s, isReasoning: true }))
+            } else if (data.type === 'progress') {
+              setState(s => ({ ...s, fetchedComments: data.fetched, totalComments: data.total }))
+            } else if (data.type === 'token') {
+              setState(s => ({ ...s, isReasoning: false, streamedText: s.streamedText + data.token }))
             } else if (data.type === 'complete') {
               setState(s => ({
                 ...s,
                 streaming: false,
+                phase: 'idle',
                 done: true,
                 streamedText: '',
                 overview: data.overview ?? '',
@@ -165,18 +192,18 @@ export function SummarizeButton({
                 summary: data.summary ?? '',
               }))
             } else if (data.type === 'error') {
-              setState(s => ({ ...s, streaming: false, error: data.message }))
+              setState(s => ({ ...s, streaming: false, phase: 'idle', error: data.message }))
             }
           } catch { /* skip malformed */ }
         }
       }
     } catch (err) {
-      setState(s => ({ ...s, streaming: false, error: String(err) }))
+      setState(s => ({ ...s, streaming: false, phase: 'idle', error: String(err) }))
     }
   }
 
-  const { streaming, streamedText, overview, insights, worthReading, verdict, sentiment,
-          keyPoints, summary, done, error } = state
+  const { streaming, phase, isReasoning, fetchedComments, totalComments, streamedText, overview,
+          insights, worthReading, verdict, sentiment, keyPoints, summary, done, error } = state
 
   // Detect old-format summary (no overview — legacy cached result)
   const isLegacyFormat = done && !overview && (keyPoints.length > 0 || summary)
@@ -217,26 +244,91 @@ export function SummarizeButton({
           >
             <div className="p-4 rounded-xl bg-[var(--surface)] border border-[var(--border-color)] space-y-4">
 
-              {/* Streaming state — show token count progress, not raw JSON */}
+              {/* Streaming state — phase-aware with progressive reveal */}
               {streaming && (
                 <div className="space-y-3">
-                  <div className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
-                    <Loader2 className="size-3.5 animate-spin shrink-0" />
-                    <span>
-                      {streamedText
-                        ? `Thinking… (${streamedText.length} tokens)`
-                        : 'Analyzing discussion…'}
-                    </span>
-                  </div>
-                  {streamedText && (
-                    <div className="flex gap-1">
-                      {[0, 1, 2].map(i => (
-                        <span
-                          key={i}
-                          className="inline-block w-1.5 h-1.5 rounded-full bg-brand animate-pulse"
-                          style={{ animationDelay: `${i * 150}ms` }}
-                        />
-                      ))}
+                  {/* Fetching phase: progress bar */}
+                  {phase === 'fetching' && (() => {
+                    const pct = totalComments > 0 ? Math.round((fetchedComments / totalComments) * 100) : 0
+                    const filled = Math.round(pct / 5)
+                    const bar = '█'.repeat(filled) + '░'.repeat(20 - filled)
+                    return (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
+                          <Loader2 className="size-3 animate-spin shrink-0" />
+                          <span>Fetching discussion threads…</span>
+                        </div>
+                        <div className="font-mono text-xs text-[var(--muted-foreground)] tracking-tight">
+                          [{bar}] {fetchedComments}/{totalComments > 0 ? totalComments : '?'}
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  {/* Thinking phase: label */}
+                  {phase === 'thinking' && (
+                    <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
+                      <Loader2 className="size-3 animate-spin shrink-0" />
+                      <span>
+                        {streamedText
+                          ? 'Building summary…'
+                          : isReasoning
+                          ? 'Model reasoning…'
+                          : 'Analyzing comments…'}
+                      </span>
+                      {isReasoning && (
+                        <span className="flex gap-0.5">
+                          {[0, 1, 2].map(i => (
+                            <span key={i} className="inline-block w-1 h-1 rounded-full bg-amber-500 animate-pulse"
+                              style={{ animationDelay: `${i * 150}ms` }} />
+                          ))}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Progressive overview — appears as soon as extracted from stream */}
+                  {overview && (
+                    <motion.p
+                      initial={{ opacity: 0, y: 4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="text-sm text-[var(--foreground)] leading-relaxed"
+                    >
+                      {overview}
+                    </motion.p>
+                  )}
+
+                  {/* Progressive insights — each fades in as parsed */}
+                  {insights.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">
+                        Key Insights
+                      </p>
+                      <div className="space-y-2">
+                        {insights.map((insight, i) => {
+                          const type = (insight.type ?? 'fact') as InsightType
+                          return (
+                            <motion.div
+                              key={i}
+                              initial={{ opacity: 0, x: -6 }}
+                              animate={{ opacity: 1, x: 0 }}
+                              transition={{ delay: i * 0.05 }}
+                              className={`pl-3 border-l-2 ${INSIGHT_BORDER[type] ?? 'border-l-blue-500/60'} space-y-0.5`}
+                            >
+                              <div className="flex items-center gap-1.5">
+                                {INSIGHT_ICONS[type] ?? INSIGHT_ICONS.fact}
+                                <span className="text-xs font-semibold text-[var(--foreground)]">{insight.title}</span>
+                                {insight.author && (
+                                  <span className="text-xs text-brand ml-auto shrink-0">@{insight.author}</span>
+                                )}
+                              </div>
+                              {insight.detail && (
+                                <p className="text-xs text-[var(--muted-foreground)] leading-relaxed">{insight.detail}</p>
+                              )}
+                            </motion.div>
+                          )
+                        })}
+                      </div>
                     </div>
                   )}
                 </div>

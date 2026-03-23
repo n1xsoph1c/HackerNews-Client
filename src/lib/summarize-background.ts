@@ -3,7 +3,7 @@ import {
   getActiveModel,
   getOllamaClient,
   selectCommentsForSummary,
-  buildRichSummaryPrompt,
+  buildSummaryMessages,
   findCommentId,
   SummarySchema,
   SummaryJsonSchema,
@@ -63,7 +63,7 @@ async function runSummarize(storyId: number, storyTitle: string, model: string):
   if (!comments) return
 
   const commentsText = selectCommentsForSummary(comments, model)
-  const prompt = buildRichSummaryPrompt(commentsText, storyTitle)
+  const messages = buildSummaryMessages(commentsText, storyTitle)
   const ollama = getOllamaClient()
 
   const abort = new AbortController()
@@ -73,7 +73,7 @@ async function runSummarize(storyId: number, storyTitle: string, model: string):
   try {
     const response = await ollama.chat({
       model,
-      messages: [{ role: 'user', content: prompt }],
+      messages,
       format: SummaryJsonSchema,
       stream: true,
       options: { temperature: 0 },

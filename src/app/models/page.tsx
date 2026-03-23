@@ -2,6 +2,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { ModelCard } from '@/components/models/ModelCard'
 import { PullForm } from '@/components/models/PullForm'
+import { PullProgress } from '@/components/models/PullProgress'
+import { StatsPanel } from '@/components/models/StatsPanel'
 import { Separator } from '@/components/ui/separator'
 import { Loader2, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -17,6 +19,8 @@ export default function ModelsPage() {
   const [activeModel, setActiveModel] = useState('')
   const [loading, setLoading] = useState(true)
   const [ollamaDown, setOllamaDown] = useState(false)
+  const [startupModel, setStartupModel] = useState<string | null>(null)
+  const [autoPulling, setAutoPulling] = useState(false)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -32,7 +36,13 @@ export default function ModelsPage() {
         setOllamaDown(true)
       } else {
         setOllamaDown(false)
-        setModels(modelsData.models ?? [])
+        const installed: OllamaModel[] = modelsData.models ?? []
+        setModels(installed)
+        const sm: string | null = modelsData.startupModel ?? null
+        setStartupModel(sm)
+        if (sm && !installed.some(m => m.name === sm)) {
+          setAutoPulling(true)
+        }
       }
       setActiveModel(activeData.model ?? '')
     } catch {
@@ -68,9 +78,26 @@ export default function ModelsPage() {
         </Button>
       </div>
 
+      <div className="mb-6">
+        <StatsPanel />
+      </div>
+
       {ollamaDown && (
         <div className="p-4 mb-6 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-500">
           Ollama is not reachable. Make sure the service is running.
+        </div>
+      )}
+
+      {/* Auto-pull startup model */}
+      {autoPulling && startupModel && (
+        <div className="p-4 rounded-xl bg-[var(--surface)] border border-[var(--border-color)] mb-4">
+          <p className="text-xs font-medium text-[var(--foreground)] mb-3">
+            Downloading startup model: {startupModel}
+          </p>
+          <PullProgress
+            model={startupModel}
+            onComplete={() => { setAutoPulling(false); refresh() }}
+          />
         </div>
       )}
 

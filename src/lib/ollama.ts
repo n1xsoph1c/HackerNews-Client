@@ -119,35 +119,75 @@ export function selectCommentsForSummary(
   return lines.join("\n")
 }
 
-export function buildRichSummaryPrompt(commentsText: string, storyTitle: string): string {
-  return `You are analyzing a Hacker News discussion. Story: "${storyTitle}"
+export function buildSummaryMessages(commentsText: string, storyTitle: string) {
+  const lineCount = commentsText.split('\n').filter(l => l.trim()).length
+  const maxInsights = Math.max(1, Math.min(5, lineCount))
+  const maxWorthReading = Math.max(1, Math.min(3, lineCount))
 
-Rules:
-- insights: 4-7 items, most important first
-- worth_reading: 2-4 real authors that exist in the comments below (not synthesized)
-- preview must be the exact first ~75 characters of their comment text
-- Be specific: reference actual claims, tools, names, numbers from the discussion
-
-Comments:
-${commentsText}`
+  return [
+    {
+      role: "system" as const,
+      content:
+        "You are an expert reader and analyst of Hacker News discussions. " +
+        "Your job is to distill threads into sharp, opinionated summaries that save the reader time " +
+        "and surface what actually matters. You write like a thoughtful senior engineer journaling " +
+        "after reading a thread — concise, direct, no filler. " +
+        "Output ONLY valid JSON. Never invent authors, quotes, or topics absent from the input.",
+    },
+    {
+      role: "user" as const,
+      content:
+        `Analyze this Hacker News thread and produce a JSON summary.\n\n` +
+        `Story: "${storyTitle}"\n\n` +
+        `FIELDS:\n` +
+        `- overview: 2-3 sentences. Name the core tension or debate. What do people actually disagree about? Be specific, not generic.\n` +
+        `- insights: up to ${maxInsights} items. Each insight has:\n` +
+        `    title: 4-8 word headline ONLY (e.g. "CRDTs break program semantics" or "Tooling beats algorithmic fixes") — NOT a full sentence\n` +
+        `    detail: 1-2 sentences elaborating with the actual claim or evidence from the comment\n` +
+        `    author: exact username from comments\n` +
+        `    type: pick the most fitting — "fact" (technical claim/data), "debate" (contested opinion), "warning" (risk/downside), "tip" (actionable advice), "counterpoint" (challenges the main view). Vary types across insights.\n` +
+        `- worth_reading: up to ${maxWorthReading} comments worth reading in full. Use exact opening words as preview.\n` +
+        `- sentiment: overall tone (positive/negative/mixed/neutral)\n` +
+        `- verdict: one punchy sentence — should you read this thread, and why?\n\n` +
+        (commentsText ? `Comments:\n${commentsText}` : "(No comments yet — respond accordingly)"),
+    },
+  ]
 }
 
-// Server-side: find a comment's ID by matching author + start of preview text
+// Server-side: find a comment's ID by matching author + preview text.
+// Uses progressively looser matching to handle LLM paraphrasing.
 export function findCommentId(
   comments: HNComment[],
   author: string,
   preview: string
 ): number | null {
-  const normalize = (s: string) =>
-    s.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().toLowerCase()
-  const needle = normalize(preview).slice(0, 75)
-  if (!needle) return null
+  const norm = (s: string) =>
+    s.replace(/<[^>]+>/g, " ")
+     .replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&")
+     .replace(/&#x2F;/gi, "/").replace(/&#x27;/gi, "'").replace(/&quot;/g, '"')
+     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+     .replace(/\s+/g, " ").trim().toLowerCase()
+
+  // Strip LLM-added leading quotes / trailing ellipsis
+  const cleaned = norm(preview).replace(/^["'""']+/, "").replace(/[…"'""'…]+$/, "").trim()
+  const n40 = cleaned.slice(0, 40)
+  const n20 = cleaned.slice(0, 20)
+  if (n20.length < 5) return null
 
   const flat = flattenAll(comments)
+
+  // Pass 1: exact author, 40-char prefix
   for (const c of flat) {
-    if (c.by === author && normalize(c.text).startsWith(needle)) {
-      return c.id
-    }
+    if (c.by === author && norm(c.text).startsWith(n40)) return c.id
   }
+  // Pass 2: exact author, 40-char anywhere
+  for (const c of flat) {
+    if (c.by === author && norm(c.text).includes(n40)) return c.id
+  }
+  // Pass 3: exact author, 20-char anywhere (handles heavy paraphrasing)
+  for (const c of flat) {
+    if (c.by === author && norm(c.text).includes(n20)) return c.id
+  }
+
   return null
 }

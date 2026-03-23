@@ -56,6 +56,28 @@ export function Comment({ comment, isDesktop = false }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Listen for reveal events from "Worth Reading" clicks — expand if target is in this subtree
+  useEffect(() => {
+    function containsId(c: HNComment, id: number): boolean {
+      if (c.id === id) return true
+      return c.children.some(child => containsId(child, id))
+    }
+
+    function onReveal(e: Event) {
+      const { id } = (e as CustomEvent<{ id: number }>).detail
+      const inChildren = comment.children.some(c => containsId(c, id))
+      const inKids = (comment.kids ?? []).includes(id)
+      if (inChildren || inKids) {
+        setExpanded(true)
+        if (hasUnloaded) loadReplies()
+      }
+    }
+
+    window.addEventListener('hn:reveal-comment', onReveal)
+    return () => window.removeEventListener('hn:reveal-comment', onReveal)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comment.children, comment.kids, hasUnloaded])
+
   async function handleExpand() {
     if (hasUnloaded) await loadReplies()
     setExpanded(e => !e)

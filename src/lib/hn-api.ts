@@ -88,7 +88,8 @@ export async function fetchFeed(
 async function fetchCommentTree(
   ids: number[],
   depth: number,
-  counter: { count: number }
+  counter: { count: number },
+  onProgress?: (fetched: number) => void
 ): Promise<HNComment[]> {
   if (depth >= 3 || !ids || ids.length === 0) return []
 
@@ -103,6 +104,7 @@ async function fetchCommentTree(
     const raw = item as Record<string, unknown>
     if (raw.dead || raw.deleted || !raw.by) continue
     counter.count++
+    onProgress?.(counter.count)
 
     const comment: HNComment = {
       id: raw.id as number,
@@ -118,7 +120,8 @@ async function fetchCommentTree(
       comment.children = await fetchCommentTree(
         raw.kids as number[],
         depth + 1,
-        counter
+        counter,
+        onProgress
       )
     }
 
@@ -129,15 +132,18 @@ async function fetchCommentTree(
 }
 
 export async function fetchStoryWithComments(
-  id: number
+  id: number,
+  onProgress?: (fetched: number, total: number) => void
 ): Promise<{ story: HNStory; comments: HNComment[] } | null> {
   const item = await fetchItem(id)
   if (!item || !("title" in item)) return null
 
   const story = item as HNStory
+  const total = Math.min(story.descendants ?? 0, 150)
   const counter = { count: 0 }
   const comments = story.kids
-    ? await fetchCommentTree(story.kids, 0, counter)
+    ? await fetchCommentTree(story.kids, 0, counter,
+        onProgress ? (n) => onProgress(n, total) : undefined)
     : []
 
   return { story, comments }

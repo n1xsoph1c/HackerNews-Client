@@ -3,7 +3,7 @@ import { db } from "@/lib/db"
 import {
   getActiveModel,
   getOllamaClient,
-  buildRichSummaryPrompt,
+  buildSummaryMessages,
   selectCommentsForSummary,
   SummaryJsonSchema,
 } from "@/lib/ollama"
@@ -90,12 +90,16 @@ export async function POST(request: NextRequest) {
     async start(controller) {
       let fullText = ""
       try {
-        // Emit a waiting token immediately so the client knows work has started
+        // Signal: fetching comments from HN API
         controller.enqueue(encoder.encode(
-          `data: ${JSON.stringify({ type: "token", token: "" })}\n\n`
+          `data: ${JSON.stringify({ type: "phase", phase: "fetching" })}\n\n`
         ))
 
-        const storyData = await fetchStoryWithComments(storyId)
+        const storyData = await fetchStoryWithComments(storyId, (fetched, total) => {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ type: "progress", fetched, total })}\n\n`
+          ))
+        })
         if (!storyData) {
           controller.enqueue(encoder.encode(
             `data: ${JSON.stringify({ type: "error", message: "Story not found" })}\n\n`
@@ -105,7 +109,12 @@ export async function POST(request: NextRequest) {
 
         const title = storyTitle || storyData.story.title
         const commentsText = selectCommentsForSummary(storyData.comments, model)
-        const prompt = buildRichSummaryPrompt(commentsText, title)
+        const messages = buildSummaryMessages(commentsText, title)
+
+        // Signal: LLM is now generating
+        controller.enqueue(encoder.encode(
+          `data: ${JSON.stringify({ type: "phase", phase: "thinking" })}\n\n`
+        ))
 
         const abort = new AbortController()
         const timeout = setTimeout(() => abort.abort(), 120_000)
@@ -113,18 +122,29 @@ export async function POST(request: NextRequest) {
         try {
           const response = await ollama.chat({
             model,
-            messages: [{ role: "user", content: prompt }],
+            messages,
             format: SummaryJsonSchema,
             stream: true,
             options: { temperature: 0 },
           })
 
           for await (const chunk of response) {
+            // Thinking models (qwen3, deepseek-r1, etc.) put reasoning in message.thinking
+            // and emit empty content tokens during that phase — detect and signal separately
+            const thinking = (chunk.message as unknown as Record<string, unknown>).thinking
+            if (thinking) {
+              controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify({ type: "reasoning" })}\n\n`
+              ))
+            }
+
             const token = chunk.message.content
-            fullText += token
-            controller.enqueue(encoder.encode(
-              `data: ${JSON.stringify({ type: "token", token })}\n\n`
-            ))
+            if (token) {
+              fullText += token
+              controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify({ type: "token", token })}\n\n`
+              ))
+            }
           }
         } finally {
           clearTimeout(timeout)

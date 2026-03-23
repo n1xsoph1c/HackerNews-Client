@@ -39,7 +39,7 @@ COPY --from=builder /app/package.json ./package.json
 
 # Entrypoint
 COPY entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+RUN sed -i 's/\r//' entrypoint.sh && chmod +x entrypoint.sh
 
 EXPOSE 3000
 ENTRYPOINT ["./entrypoint.sh"]

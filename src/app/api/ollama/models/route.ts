@@ -5,7 +5,7 @@ export async function GET() {
   try {
     const ollama = getOllamaClient()
     const { models } = await ollama.list()
-    return NextResponse.json({ models })
+    return NextResponse.json({ models, startupModel: process.env.OLLAMA_MODEL ?? null })
   } catch (error) {
     console.error("Failed to list models:", error)
     return NextResponse.json({ models: [], error: "Ollama not reachable" }, { status: 503 })
