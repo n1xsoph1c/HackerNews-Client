@@ -71,6 +71,8 @@ Children append to Comment component state
 
 ### AI Summary Flow
 
+Progressive multi-round summarization — the UI shows a draft immediately and refines it as more data arrives. Each depth-1 batch is pre-fetched in the background while the LLM generates the prior round, so fetch latency is hidden inside LLM generation time.
+
 ```
 User clicks "Summarize Discussion"
         │
@@ -78,47 +80,75 @@ User clicks "Summarize Discussion"
 POST /api/summarize { storyId, storyTitle }
         │
         ▼
-Summary in DB? (same model, has overview field?)
+Summary in DB? (same model + non-empty overview?)
         │
        YES ──────────────────────────────────────────► Return cached instantly
         │
        NO
         │
         ▼
-fetchStoryWithComments()    ← full BFS tree (for sampling + ID resolution)
+getCachedStory()     ← shallow comments already in StoryCache (free, no API calls)
+  or fetchStoryShallow() if cache miss
         │
         ▼
-selectCommentsForSummary()
+Determine round count based on thread size + model capability:
+  ├── isSmallModel() or no replies  →  1 round  (CPU 3b/4b: fast, single-shot)
+  ├── ≤ 25 parents with replies      →  2 rounds
+  └── > 25 parents with replies      →  3 rounds
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Round 1 (immediate draft)                                      │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ LLM ← shallow depth-0 comments                         │    │
+│  │ SSE tokens → browser live preview                       │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  └─► roundComplete event → UI renders draft summary            │
+│  [in parallel while LLM runs: fetchDepth1ForComments(batch 1)] │
+└─────────────────────────────────────────────────────────────────┘
+        │
+        ▼ (if totalRounds ≥ 2)
+┌─────────────────────────────────────────────────────────────────┐
+│  Round 2 (improved summary)                                     │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ LLM ← shallow + depth-1 replies for first 25 parents   │    │
+│  │ SSE tokens → browser live preview                       │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  └─► roundComplete → UI replaces draft with refined summary    │
+│  [in parallel while LLM runs: fetchDepth1ForComments(batch 2)] │
+└─────────────────────────────────────────────────────────────────┘
+        │
+        ▼ (if totalRounds = 3)
+┌─────────────────────────────────────────────────────────────────┐
+│  Round 3 (final quality)                                        │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ LLM ← shallow + all depth-1 replies (both batches)     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  └─► parseCacheAndStore() → db.summary.upsert()                │
+│  └─► complete event → final UI                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+selectCommentsForSummary() (runs at each round):
   ├── Flatten all comments with depth + char count
-  ├── Filter < 40 chars (noise)
+  ├── Filter < 40 chars (noise), cap each at 800 chars
   ├── Sort by depth-0 first, then length DESC
-  ├── Sample across thread (beginning/middle/end)
-  └── Pack into budget: 3b→3500, 7b→6000, 70b→12000 chars
-        │
-        ▼
-ollama.chat({ stream: true })
-        │
-        ▼
-SSE tokens stream to browser ──────────────────────► "Thinking… (N tokens)"
-        │
-        ▼ (on stream complete)
-JSON.parse(fullText)
-  └── Double-encoding fix: if overview wraps full JSON, unwrap it
-        │
-        ▼
-resolveCommentIds()    ← match worth_reading.author + preview → comment DOM id
-        │
-        ▼
-db.summary.upsert()
-        │
-        ▼
-SSE "complete" event ──────────────────────────────► Render rich summary UI:
-                                                       - Overview paragraph
-                                                       - Insight cards (icon + type)
-                                                       - "Worth Reading" chips
-                                                         (click → smooth scroll
-                                                          + highlight ring)
-                                                       - Verdict line
+  ├── Sample across thread (beginning/middle/end for breadth)
+  └── Pack into context budget:
+        phi4-mini → 6,000 chars   (+ num_ctx: 8192 unlocked)
+        3b/4b     → 3,500 chars
+        7b/8b     → 6,000 chars
+        70b+      → 12,000 chars
+
+LLM output format — plain labeled text (no JSON):
+  SENTIMENT: positive/negative/mixed/neutral
+  OVERVIEW: 2-3 sentences on the core debate
+  VERDICT: one sentence — is this thread worth reading?
+  INSIGHT: headline; type; explanation; author
+  WORTH: username; exact opening words; why it's notable
+
+findCommentId() — matches WORTH entries back to real comment IDs
+  using progressive fuzzy matching (40-char prefix → 40-char anywhere → 20-char)
+  so "Worth Reading" chips scroll directly to the comment in the thread
 ```
 
 ---
@@ -163,7 +193,7 @@ SSE "complete" event ───────────────────�
 
 ## GPU Setup (Recommended)
 
-CPU mode (default) runs `llama3.2:3b` at ~6 tokens/sec — functional but slow on large threads. For GPU (e.g. RTX 5060 Ti):
+CPU mode (default) uses `phi4-mini` — functional for smaller threads but can take 1-2 minutes per round on larger ones. For GPU (e.g. RTX 5060 Ti):
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
@@ -174,10 +204,13 @@ Override the model via env:
 OLLAMA_MODEL=qwen2.5:7b docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
 
-Context budget scales automatically with model size:
-- `3b` models → 3,500 chars of comments sampled
+Context budget and round count scale automatically with model size and thread depth:
+- `phi4-mini` → 6,000 chars + 8192 token context window unlocked
+- `3b/4b` models → 3,500 chars
 - `7b/8b` models → 6,000 chars
 - `70b+` models → 12,000 chars
+
+Small models (`3b`/`4b`, excluding `phi4-mini`) do only 1 round — fast and accurate enough for the context they can handle. Larger models do up to 3 rounds over progressively richer data.
 
 ---
 
@@ -220,6 +253,14 @@ Requires `.env` with `DATABASE_URL` + `OLLAMA_BASE_URL` pointing to running inst
 **Why smart comment sampling?** Sequential truncation always picks the same early comments, missing the rest of the thread. The sampler scores by depth + length and samples across beginning/middle/end for representative coverage within the LLM context window.
 
 **Why SSE instead of WebSockets?** One-directional streaming (server→client), simpler, works with Next.js route handlers without extra setup. Ollama's JS client exposes an async iterator that maps naturally to SSE.
+
+**Why plain-text output instead of JSON?** Early versions used `format: SummaryJsonSchema` (Zod → GBNF grammar-constrained decoding). This caused 1.7× slower generation per token and small models (especially phi4-mini) would exhaust `num_predict` entirely on internal reasoning with zero content output. Switching to labeled plain-text (`INSIGHT: headline; type; detail; author`) is more reliable, never throws on parse failure, and falls back gracefully when the model deviates.
+
+**Why progressive rounds instead of one big call?** A single call over a large context budget is slow to start and gives vague results if the model is small. Progressive rounds let users see a draft in ~15-30s while the system quietly fetches more data and refines. Each batch of depth-1 replies is pre-fetched in the background while the prior LLM call runs, so fetch latency is hidden. The final round result is cached — subsequent loads are instant.
+
+**Why phi4-mini as the default model?** phi4-mini (3.8B) outperforms llama3.2:3b on instruction-following and structured output while being similarly compact. On GPU it generates at ~30-60 tok/s. Key quirk: phi4-mini routes all content through its `thinking` field (chain-of-thought by default) — the Ollama API `think: false` option doesn't suppress this, so the code captures `thinkingText` as a fallback when `content` is empty.
+
+**Model warm-up on startup:** After Docker pulls the model weights, a minimal generate request (`"hi"`, `num_predict: 1`) forces the model into memory/VRAM. Without this, the first real summarization request triggers a ~60s cold-load pause even though the model is downloaded.
 
 ---
 

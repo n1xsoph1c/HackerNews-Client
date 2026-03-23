@@ -5,9 +5,10 @@ import {
   getOllamaClient,
   buildSummaryMessages,
   selectCommentsForSummary,
-  SummarySchema,
-  SummaryJsonSchema,
+  parseStructuredSummary,
   findCommentId,
+  isThinkingModel,
+  getNumCtx,
 } from "@/lib/ollama"
 import { fetchStoryShallow, fetchDepth1ForComments, type HNComment } from "@/lib/hn-api"
 import { getCachedStory } from "@/lib/story-cache"
@@ -129,9 +130,13 @@ export async function POST(request: NextRequest) {
     return new Response(stream, sseHeaders())
   }
 
-  // No cache, no in-flight — generate incrementally in up to 2 rounds:
-  //   Round 1: shallow comments (from StoryCache, essentially free) → immediate summary
-  //   Round 2: depth-1 replies fetched in one parallel batch → refined summary + DB cache
+  // No cache, no in-flight — generate progressively in up to 3 rounds:
+  //   Round 1: shallow comments (StoryCache, essentially free) → immediate draft
+  //   Round 2: + depth-1 replies for first 25 parents → improved summary
+  //   Round 3: + depth-1 replies for remaining parents → final quality, cached
+  // Each depth-1 batch is pre-fetched in the background while the LLM generates the prior round,
+  // so fetch latency is hidden inside LLM generation time.
+  const BATCH_SIZE = 25
   const encoder = new TextEncoder()
   const ollama = getOllamaClient()
 
@@ -144,19 +149,30 @@ export async function POST(request: NextRequest) {
       async function runLLM(commentsText: string, title: string): Promise<string> {
         const messages = buildSummaryMessages(commentsText, title)
         const abort = new AbortController()
-        const timeout = setTimeout(() => abort.abort(), 120_000)
+        const timeout = setTimeout(() => abort.abort(), 180_000)
         let fullText = ""
+        let thinkingText = ""
         try {
+          const ollamaOptions: Record<string, unknown> = {
+            temperature: 0,
+            num_predict: 2000,
+            num_ctx: getNumCtx(model),
+          }
+          if (isThinkingModel(model)) ollamaOptions.think = false
+
           const response = await ollama.chat({
             model,
             messages,
-            format: SummaryJsonSchema,
             stream: true,
-            options: { temperature: 0 },
+            options: ollamaOptions,
           })
           for await (const chunk of response) {
-            const thinking = (chunk.message as unknown as Record<string, unknown>).thinking
-            if (thinking) emit({ type: "reasoning" })
+            const raw = chunk.message as unknown as Record<string, unknown>
+            const thinking = raw.thinking as string | undefined
+            if (thinking) {
+              thinkingText += thinking
+              emit({ type: "reasoning" })
+            }
             const token = chunk.message.content
             if (token) {
               fullText += token
@@ -166,36 +182,28 @@ export async function POST(request: NextRequest) {
         } finally {
           clearTimeout(timeout)
         }
+        if (!fullText && thinkingText) return thinkingText
         return fullText
       }
 
-      function parseRound1(fullText: string, comments: HNComment[]) {
-        const parsed = SummarySchema.parse(JSON.parse(fullText))
-        const worthReading = (parsed.worth_reading ?? []).map(wr => ({
+      function parseRound(fullText: string, comments: HNComment[]) {
+        const parsed = parseStructuredSummary(fullText)
+        if (!parsed.overview && parsed.insights.length === 0) return null
+        const worthReading = parsed.worthReading.map(wr => ({
           ...wr,
           commentId: findCommentId(comments, wr.author, wr.preview),
         }))
-        return {
-          overview: parsed.overview,
-          insights: parsed.insights,
-          worthReading,
-          verdict: parsed.verdict,
-          sentiment: parsed.sentiment,
-          keyPoints: parsed.insights.map(i => i.title),
-        }
+        return { ...parsed, worthReading }
       }
 
       try {
-        // ── Round 1: shallow comments ──────────────────────────────────────
-        emit({ type: "roundStart", round: 1, totalRounds: 2 })
-
+        // ── Fetch shallow comments ─────────────────────────────────────────
         const cachedStory = await getCachedStory(storyId)
         let shallowComments = cachedStory?.comments
 
         if (!shallowComments) {
-          // Cache miss — fetch shallow (fast: ~20-50 API calls)
           emit({ type: "phase", phase: "fetching" })
-          const fetched = await fetchStoryShallow(storyId, (fetched, total) => emit({ type: "progress", fetched, total }))
+          const fetched = await fetchStoryShallow(storyId, (f, t) => emit({ type: "progress", fetched: f, total: t }))
           if (!fetched) {
             emit({ type: "error", message: "Story not found" })
             return
@@ -205,22 +213,36 @@ export async function POST(request: NextRequest) {
 
         const title = storyTitle ?? cachedStory?.story.title ?? String(storyId)
 
+        // Determine how many rounds based on thread size and model capability
+        const parentsWithKids = shallowComments.filter(c => c.kids && c.kids.length > 0)
+        const hasReplies = parentsWithKids.length > 0
+        const manyParents = parentsWithKids.length > BATCH_SIZE
+
+        let totalRounds: number
+        if (!hasReplies) {
+          totalRounds = 1
+        } else if (manyParents) {
+          totalRounds = 3
+        } else {
+          totalRounds = 2
+        }
+
+        // ── Round 1 ────────────────────────────────────────────────────────
+        emit({ type: "roundStart", round: 1, totalRounds })
+
+        // Pre-fetch depth-1 batch 1 in background while LLM generates round 1
+        // (no progress events — hidden inside LLM thinking time)
+        const batch1Promise = totalRounds > 1
+          ? fetchDepth1ForComments(parentsWithKids.slice(0, BATCH_SIZE))
+          : Promise.resolve([] as HNComment[])
+
         emit({ type: "phase", phase: "thinking" })
         const round1Text = await runLLM(selectCommentsForSummary(shallowComments, model), title)
 
-        let round1Result: ReturnType<typeof parseRound1> | null = null
-        try {
-          round1Result = parseRound1(round1Text, shallowComments)
-          emit({ type: "roundComplete", round: 1, ...round1Result })
-        } catch {
-          // Round 1 parse failed — proceed to round 2 silently
-        }
+        const round1Result = parseRound(round1Text, shallowComments)
+        if (round1Result) emit({ type: "roundComplete", round: 1, ...round1Result })
 
-        // ── Round 2: depth-1 replies ───────────────────────────────────────
-        const hasReplies = shallowComments.some(c => c.kids && c.kids.length > 0)
-
-        if (!hasReplies) {
-          // No replies exist — round 1 is final; cache and emit complete
+        if (totalRounds === 1) {
           if (round1Result) {
             await parseCacheAndStore(round1Text, storyId, model, shallowComments)
             emit({ type: "complete", ...round1Result })
@@ -230,22 +252,56 @@ export async function POST(request: NextRequest) {
           return
         }
 
-        emit({ type: "roundStart", round: 2, totalRounds: 2 })
-        emit({ type: "phase", phase: "fetching" })
+        // ── Round 2 ────────────────────────────────────────────────────────
+        // Batch 1 fetch ran in parallel with round 1 LLM — should be ready by now
+        const enrichedBatch1 = await batch1Promise
+        const enrichedMap = new Map<number, HNComment>()
+        for (const c of enrichedBatch1) enrichedMap.set(c.id, c)
+        const round2Comments = shallowComments.map(c => enrichedMap.get(c.id) ?? c)
 
-        const enrichedComments = await fetchDepth1ForComments(
-          shallowComments,
-          (fetched, total) => emit({ type: "progress", fetched, total })
-        )
+        emit({ type: "roundStart", round: 2, totalRounds })
+
+        // Pre-fetch depth-1 batch 2 in background while LLM generates round 2
+        const batch2Promise = totalRounds > 2
+          ? fetchDepth1ForComments(parentsWithKids.slice(BATCH_SIZE))
+          : Promise.resolve([] as HNComment[])
 
         emit({ type: "phase", phase: "thinking" })
-        const round2Text = await runLLM(selectCommentsForSummary(enrichedComments, model), title)
+        const round2Text = await runLLM(selectCommentsForSummary(round2Comments, model), title)
 
-        const result = await parseCacheAndStore(round2Text, storyId, model, enrichedComments)
+        const round2Result = parseRound(round2Text, round2Comments)
+        if (round2Result) emit({ type: "roundComplete", round: 2, ...round2Result })
+
+        if (totalRounds === 2) {
+          const result = await parseCacheAndStore(round2Text, storyId, model, round2Comments)
+          if (result) {
+            emit({ type: "complete", ...result })
+          } else if (round2Result) {
+            emit({ type: "complete", ...round2Result })
+          } else if (round1Result) {
+            emit({ type: "complete", ...round1Result })
+          } else {
+            emit({ type: "error", message: "Failed to generate summary" })
+          }
+          return
+        }
+
+        // ── Round 3 ────────────────────────────────────────────────────────
+        // Batch 2 fetch ran in parallel with round 2 LLM — should be ready by now
+        const enrichedBatch2 = await batch2Promise
+        for (const c of enrichedBatch2) enrichedMap.set(c.id, c)
+        const round3Comments = shallowComments.map(c => enrichedMap.get(c.id) ?? c)
+
+        emit({ type: "roundStart", round: 3, totalRounds })
+        emit({ type: "phase", phase: "thinking" })
+        const round3Text = await runLLM(selectCommentsForSummary(round3Comments, model), title)
+
+        const result = await parseCacheAndStore(round3Text, storyId, model, round3Comments)
         if (result) {
           emit({ type: "complete", ...result })
+        } else if (round2Result) {
+          emit({ type: "complete", ...round2Result })
         } else if (round1Result) {
-          // Round 2 parse failed — fall back to cached round 1
           emit({ type: "complete", ...round1Result })
         } else {
           emit({ type: "error", message: "Failed to generate summary" })

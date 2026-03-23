@@ -4,11 +4,12 @@ import {
   getOllamaClient,
   selectCommentsForSummary,
   buildSummaryMessages,
+  parseStructuredSummary,
   findCommentId,
-  SummarySchema,
-  SummaryJsonSchema,
+  isThinkingModel,
+  getNumCtx,
 } from './ollama'
-import { fetchStoryWithComments } from './hn-api'
+import { fetchStoryWithComments, fetchDepth1ForComments } from './hn-api'
 import { getCachedStory } from './story-cache'
 
 // Module-level state — single Next.js process, single Ollama instance
@@ -67,31 +68,48 @@ async function runSummarize(storyId: number, storyTitle: string, model: string):
   const comments = cachedStory?.comments ?? (await fetchStoryWithComments(storyId))?.comments
   if (!comments) return
 
-  const commentsText = selectCommentsForSummary(comments, model)
+  // Enrich with depth-1 replies for better summary quality (background has no time pressure)
+  let enrichedComments = comments
+  if (comments.some(c => c.kids && c.kids.length > 0)) {
+    enrichedComments = await fetchDepth1ForComments(comments)
+  }
+
+  const commentsText = selectCommentsForSummary(enrichedComments, model)
   const messages = buildSummaryMessages(commentsText, storyTitle)
   const ollama = getOllamaClient()
 
   const abort = new AbortController()
-  const timeout = setTimeout(() => abort.abort(), 120_000)
+  const timeout = setTimeout(() => abort.abort(), 180_000)
 
   let fullText = ''
+  let thinkingText = ''
   try {
+    const ollamaOptions: Record<string, unknown> = {
+      temperature: 0,
+      num_predict: 2000,
+      num_ctx: getNumCtx(model),
+    }
+    if (isThinkingModel(model)) ollamaOptions.think = false
+
     const response = await ollama.chat({
       model,
       messages,
-      format: SummaryJsonSchema,
       stream: true,
-      options: { temperature: 0 },
+      options: ollamaOptions,
     })
-    for await (const chunk of response) fullText += chunk.message.content
+    for await (const chunk of response) {
+      const raw = chunk.message as unknown as Record<string, unknown>
+      const thinking = raw.thinking as string | undefined
+      if (thinking) thinkingText += thinking
+      if (chunk.message.content) fullText += chunk.message.content
+    }
   } finally {
     clearTimeout(timeout)
   }
+  if (!fullText && thinkingText) fullText = thinkingText
 
-  await parseCacheAndStore(fullText, storyId, model, comments)
+  await parseCacheAndStore(fullText, storyId, model, enrichedComments)
 }
-
-type WorthReadingRaw = { author: string; preview: string; why: string }
 
 /** Shared parse + upsert logic used by both background pre-gen and the SSE route. */
 export async function parseCacheAndStore(
@@ -107,14 +125,13 @@ export async function parseCacheAndStore(
   sentiment: string
   keyPoints: string[]
 } | null> {
-  const parsed = SummarySchema.parse(JSON.parse(fullText))
+  const parsed = parseStructuredSummary(fullText)
+  if (!parsed.overview && parsed.insights.length === 0) return null
 
-  const worthReadingRaw: WorthReadingRaw[] = parsed.worth_reading ?? []
-  const worthReading = worthReadingRaw.map((wr) => ({
+  const worthReading = parsed.worthReading.map((wr) => ({
     ...wr,
     commentId: findCommentId(comments, wr.author, wr.preview),
   }))
-  const keyPoints = parsed.insights.map((i) => i.title)
 
   const fields = {
     overview: parsed.overview,
@@ -122,7 +139,7 @@ export async function parseCacheAndStore(
     worthReading,
     verdict: parsed.verdict,
     sentiment: parsed.sentiment,
-    keyPoints,
+    keyPoints: parsed.keyPoints,
     summary: parsed.overview,
     model,
   }
@@ -133,5 +150,5 @@ export async function parseCacheAndStore(
     create: { storyId, ...fields },
   })
 
-  return { ...fields, worthReading, keyPoints }
+  return { ...fields, worthReading, keyPoints: parsed.keyPoints }
 }

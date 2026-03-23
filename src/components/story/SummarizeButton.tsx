@@ -124,28 +124,39 @@ export function SummarizeButton({
   })
   const [open, setOpen] = useState(true)
 
-  // Progressive extraction — show overview + insights as they stream, before full JSON is complete.
+  // Progressive extraction — show overview + insights as they stream, before output is complete.
   // Skipped during round 2: user reads round 1 results while the model refines in background.
   useEffect(() => {
     const { streaming, streamedText, round } = state
     if (!streaming || !streamedText || round === 2) return
 
-    // Extract overview as soon as the JSON string value is closed
-    const ovMatch = streamedText.match(/"overview"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+    // Extract OVERVIEW line as soon as it's fully output
+    const ovMatch = streamedText.match(/^OVERVIEW:\s*(.+)$/m)
     if (ovMatch) {
-      const decoded = ovMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')
+      const decoded = ovMatch[1].trim()
       if (decoded !== state.overview) setState(s => ({ ...s, overview: decoded }))
     }
 
-    // Extract completed insight objects (each has at least title + type)
-    const insightMatches = [
-      ...streamedText.matchAll(/\{\s*"title"\s*:[^{}]*"type"\s*:\s*"[^"]*"\s*\}/g)
-    ]
+    // Extract completed INSIGHT lines (handles both "INSIGHT:" and "INSIGHT |")
+    const insightMatches = [...streamedText.matchAll(/^INSIGHT[\s:|][^\n]+$/gm)]
     if (insightMatches.length > state.insights.length) {
-      try {
-        const newInsights = insightMatches.map(m => JSON.parse(m[0])) as Insight[]
-        setState(s => ({ ...s, insights: newInsights }))
-      } catch { /* partial match — skip */ }
+      const TYPES = new Set(['fact','debate','warning','tip','counterpoint'])
+      const newInsights = insightMatches.map(m => {
+        const content = m[0].replace(/^INSIGHT[\s:]*[|;]?\s*/i, '')
+        const parts = content.includes('; ') ? content.split(/\s*;\s*/) : content.split(/\s*\|\s*/)
+        const firstLower = parts[0]?.trim().toLowerCase() ?? ''
+        if (TYPES.has(firstLower)) {
+          const detail = parts[1]?.trim() ?? ''
+          return { title: detail.slice(0, 60), type: firstLower as InsightType, detail, author: parts[2]?.trim() || null }
+        }
+        return {
+          title: parts[0]?.trim() ?? '',
+          type: (parts[1]?.trim() ?? 'fact') as InsightType,
+          detail: parts[2]?.trim() ?? '',
+          author: parts[3]?.trim() || null,
+        }
+      }).filter(i => i.title)
+      setState(s => ({ ...s, insights: newInsights }))
     }
   }, [state.streamedText]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -272,7 +283,7 @@ export function SummarizeButton({
       </div>
 
       <AnimatePresence>
-        {(streaming || done) && open && (
+        {(streaming || done || !!error) && open && (
           <motion.div
             ref={summaryRef}
             initial={{ opacity: 0 }}
