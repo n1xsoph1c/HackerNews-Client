@@ -21,7 +21,7 @@ export function CommentThread({ comments, totalCount, isDesktop = false }: Props
   return (
     <div>
       <p className="text-xs text-[var(--muted-foreground)] mb-4">
-        Showing {comments.length} of {totalCount} top-level comments
+        {comments.length} threads · {totalCount} total comments
       </p>
       <div className="space-y-4">
         {comments.map(comment => (

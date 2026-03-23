@@ -181,6 +181,54 @@ export async function fetchStoryShallow(
   return { story, comments }
 }
 
+/**
+ * Fetches depth-1 replies for all shallow (top-level) comments in one batched parallel pass.
+ * Populates each top-level comment's children[] with its immediate replies.
+ * Uses the global semaphore — all kids across all comments are fetched concurrently.
+ */
+export async function fetchDepth1ForComments(
+  comments: HNComment[],
+  onProgress?: (fetched: number, total: number) => void
+): Promise<HNComment[]> {
+  const withKids = comments.filter(c => c.kids && c.kids.length > 0)
+  if (withKids.length === 0) return comments
+
+  const total = withKids.reduce((sum, c) => sum + Math.min(c.kids!.length, 30), 0)
+  let fetched = 0
+
+  return Promise.all(
+    comments.map(async comment => {
+      if (!comment.kids || comment.kids.length === 0) return comment
+
+      const kidItems = await Promise.all(
+        comment.kids.slice(0, 30).map(async id => {
+          const item = await fetchItem(id)
+          onProgress?.(++fetched, total)
+          return item
+        })
+      )
+
+      const children: HNComment[] = []
+      for (const raw of kidItems) {
+        if (!raw) continue
+        const r = raw as Record<string, unknown>
+        if (r.dead || r.deleted || !r.by) continue
+        children.push({
+          id: r.id as number,
+          by: r.by as string,
+          text: r.text as string | undefined,
+          time: r.time as number,
+          kids: r.kids as number[] | undefined,
+          children: [],
+          depth: 1,
+        })
+      }
+
+      return { ...comment, children }
+    })
+  )
+}
+
 // Fetches immediate children of a single comment (one level deep).
 // Each child has its own kids[] preserved but children: [] for further lazy loading.
 export async function fetchCommentReplies(commentId: number): Promise<HNComment[]> {

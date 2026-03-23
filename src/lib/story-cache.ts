@@ -1,8 +1,9 @@
 import { db } from "./db"
 import type { HNStory, HNComment } from "./hn-api"
 
-const FRESH_MS = 5  * 60 * 1000  // 0–5 min: serve immediately
-const STALE_MS = 10 * 60 * 1000  // 5–10 min: serve stale + refresh in background
+const FRESH_MS =  1 * 60 * 60 * 1000  // 0–1h: serve immediately
+const STALE_MS = 24 * 60 * 60 * 1000  // 1–24h: serve stale + refresh in background
+const PRUNE_AFTER_MS = 7 * 24 * 60 * 60 * 1000  // prune non-bookmarked caches after 7 days
 
 export type CachedStory = {
   story: HNStory
@@ -47,7 +48,35 @@ export async function setCachedStory(
         commentsJson: comments as unknown as object[],
       },
     })
+
+    // Passively prune old caches that aren't bookmarked
+    pruneOldCaches().catch(() => {})
   } catch {
     // Cache write failure is non-fatal — app still works
+  }
+}
+
+async function pruneOldCaches(): Promise<void> {
+  const cutoff = new Date(Date.now() - PRUNE_AFTER_MS)
+
+  // Find old cache entries
+  const old = await db.storyCache.findMany({
+    where: { fetchedAt: { lt: cutoff } },
+    select: { storyId: true },
+  })
+  if (old.length === 0) return
+
+  const oldIds = old.map(r => r.storyId)
+
+  // Keep any that are bookmarked
+  const bookmarked = await db.bookmark.findMany({
+    where: { storyId: { in: oldIds } },
+    select: { storyId: true },
+  })
+  const bookmarkedSet = new Set(bookmarked.map(b => b.storyId))
+
+  const toDelete = oldIds.filter(id => !bookmarkedSet.has(id))
+  if (toDelete.length > 0) {
+    await db.storyCache.deleteMany({ where: { storyId: { in: toDelete } } })
   }
 }

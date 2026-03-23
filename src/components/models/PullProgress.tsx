@@ -31,6 +31,8 @@ export function PullProgress({
   })
 
   const lastUpdate = useRef<{ time: number; completed: number } | null>(null)
+  const onCompleteRef = useRef(onComplete)
+  useEffect(() => { onCompleteRef.current = onComplete }, [onComplete])
 
   useEffect(() => {
     let cancelled = false
@@ -63,7 +65,7 @@ export function PullProgress({
 
               if (data.status === 'success') {
                 setState(s => ({ ...s, done: true, status: 'Complete!' }))
-                onComplete()
+                onCompleteRef.current()
                 return
               }
 
@@ -112,7 +114,7 @@ export function PullProgress({
       cancelled = true
       controller.abort()
     }
-  }, [model, onComplete])
+  }, [model])
 
   const { status, completed, total, speedMBs, etaSeconds, done, error } = state
   const pct = total > 0 ? (completed / total) * 100 : 0

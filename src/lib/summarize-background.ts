@@ -20,6 +20,11 @@ export function getInFlightPromise(storyId: number, model: string): Promise<void
   return inFlightPromises.get(`${storyId}:${model}`)
 }
 
+/** Returns whether Ollama is currently busy with any summarization. */
+export function isOllamaBusy(): boolean {
+  return ollamaBusy
+}
+
 /**
  * Background pre-summarization. Fires from the story page server component.
  * Skips if: summary already cached, Ollama busy with another story, or job already in flight.

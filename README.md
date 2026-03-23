@@ -229,3 +229,52 @@ Requires `.env` with `DATABASE_URL` + `OLLAMA_BASE_URL` pointing to running inst
 - `docker compose down -v` resets everything including DB and model volumes
 - Volumes `postgres_data` + `ollama_data` persist across `docker compose down` (without `-v`)
 - The `app` service entrypoint runs `prisma db push` then starts `node server.js`
+
+---
+
+## Resource Limits
+
+Ollama's CPU and memory usage can be configured via the Models page UI or environment variables.
+
+### Via UI (Recommended)
+1. Go to **Models** tab
+2. Click the ⚙️ settings icon in the System panel
+3. Adjust CPU and Memory sliders
+4. Click **Apply & Restart Ollama**
+
+### Via Environment Variables
+```bash
+OLLAMA_CPU_LIMIT=4        # Number of CPU cores (GPU mode)
+OLLAMA_MEMORY_LIMIT=8G     # Memory limit (e.g., 4G, 8G)
+```
+
+### Defaults
+- **CPU**: 50% of available cores
+- **Memory**: 50% of system RAM (auto-detected)
+
+---
+
+## Troubleshooting
+
+### Summarize gets stuck at "fetching discussion 0/?"
+**Cause**: Race condition when background pre-summarization and user-initiated summarize run concurrently.
+
+**Fix**: The API now checks if Ollama is busy and waits for any background job to complete before starting a new one. This prevents two concurrent Ollama calls that would overload the model.
+
+### Ollama shows 100% CPU usage
+**Cause**: Multiple simultaneous summarization requests (background pre-gen + user click).
+
+**Fix**: The `ollamaBusy` flag is now checked before starting new requests. Use the Resource Limits settings to cap Ollama's resource usage.
+
+### Pulling indicator keeps reappearing on Models page
+**Cause**: Auto-pull triggers on every page refresh, not just initial mount.
+
+**Fix**: Auto-pull now only triggers on initial page load and tracks the pulling state to prevent re-triggering during refresh.
+
+### GPU Setup Notes
+For GPU acceleration, use the GPU override:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+The GPU compose file sets default resource limits (4 cores, 8GB memory) which can be overridden via environment variables.

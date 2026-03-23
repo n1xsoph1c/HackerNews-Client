@@ -47,3 +47,10 @@ model Setting {
   key   String @id
   value String
 }
+
+model OllamaSettings {
+  id            Int      @id @default(1)
+  cpuLimit      Int      @default(50)
+  memoryLimitMB Int      @default(4096)
+  updatedAt     DateTime @updatedAt
+}

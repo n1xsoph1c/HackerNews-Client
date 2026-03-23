@@ -45,6 +45,10 @@ type SummaryState = {
   summary: string
   done: boolean
   error: string | null
+  // Incremental round tracking
+  round: number       // 0 = not started, 1 = first pass, 2 = refining
+  totalRounds: number
+  refining: boolean   // round 1 complete, round 2 in progress
 }
 
 const INSIGHT_ICONS: Record<InsightType, React.ReactNode> = {
@@ -114,19 +118,23 @@ export function SummarizeButton({
     summary: '',
     done: false,
     error: null,
+    round: 0,
+    totalRounds: 2,
+    refining: false,
   })
   const [open, setOpen] = useState(true)
 
-  // Progressive extraction — show overview + insights as they stream, before full JSON is complete
+  // Progressive extraction — show overview + insights as they stream, before full JSON is complete.
+  // Skipped during round 2: user reads round 1 results while the model refines in background.
   useEffect(() => {
-    const { streaming, streamedText } = state
-    if (!streaming || !streamedText) return
+    const { streaming, streamedText, round } = state
+    if (!streaming || !streamedText || round === 2) return
 
     // Extract overview as soon as the JSON string value is closed
     const ovMatch = streamedText.match(/"overview"\s*:\s*"((?:[^"\\]|\\.)*)"/)
-    if (ovMatch && !state.overview) {
+    if (ovMatch) {
       const decoded = ovMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')
-      setState(s => ({ ...s, overview: decoded }))
+      if (decoded !== state.overview) setState(s => ({ ...s, overview: decoded }))
     }
 
     // Extract completed insight objects (each has at least title + type)
@@ -142,7 +150,7 @@ export function SummarizeButton({
   }, [state.streamedText]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function summarize() {
-    setState(s => ({ ...s, streaming: true, phase: 'fetching', isReasoning: false, fetchedComments: 0, totalComments: 0, streamedText: '', overview: '', insights: [], worthReading: [], verdict: '', sentiment: '', done: false, error: null }))
+    setState(s => ({ ...s, streaming: true, phase: 'fetching', isReasoning: false, fetchedComments: 0, totalComments: 0, streamedText: '', overview: '', insights: [], worthReading: [], verdict: '', sentiment: '', done: false, error: null, round: 0, totalRounds: 2, refining: false }))
     setOpen(true)
     // Scroll summary into view on mobile (it may be above the fold if user scrolled to comments)
     setTimeout(() => summaryRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
@@ -171,7 +179,32 @@ export function SummarizeButton({
         for (const line of lines) {
           try {
             const data = JSON.parse(line.slice(6))
-            if (data.type === 'phase') {
+            if (data.type === 'roundStart') {
+              // Round 2: keep existing overview/insights visible; clear streamed text
+              setState(s => ({
+                ...s,
+                round: data.round,
+                totalRounds: data.totalRounds,
+                streamedText: '',
+                isReasoning: false,
+                refining: data.round === 2,
+              }))
+            } else if (data.type === 'roundComplete') {
+              // Round 1 done — show its results while round 2 runs in background
+              setState(s => ({
+                ...s,
+                phase: 'idle',
+                streamedText: '',
+                isReasoning: false,
+                overview: data.overview ?? '',
+                insights: (data.insights ?? []) as Insight[],
+                worthReading: (data.worthReading ?? []) as WorthReading[],
+                verdict: data.verdict ?? '',
+                sentiment: data.sentiment ?? 'neutral',
+                keyPoints: (data.keyPoints ?? []) as string[],
+                refining: true,
+              }))
+            } else if (data.type === 'phase') {
               setState(s => ({ ...s, phase: data.phase as Phase }))
             } else if (data.type === 'reasoning') {
               setState(s => ({ ...s, isReasoning: true }))
@@ -186,6 +219,7 @@ export function SummarizeButton({
                 phase: 'idle',
                 done: true,
                 streamedText: '',
+                refining: false,
                 overview: data.overview ?? '',
                 insights: data.insights ?? [],
                 worthReading: data.worthReading ?? [],
@@ -206,7 +240,8 @@ export function SummarizeButton({
   }
 
   const { streaming, phase, isReasoning, fetchedComments, totalComments, streamedText, overview,
-          insights, worthReading, verdict, sentiment, keyPoints, summary, done, error } = state
+          insights, worthReading, verdict, sentiment, keyPoints, summary, done, error,
+          round, refining } = state
 
   // Detect old-format summary (no overview — legacy cached result)
   const isLegacyFormat = done && !overview && (keyPoints.length > 0 || summary)
@@ -250,7 +285,7 @@ export function SummarizeButton({
               {/* Streaming state — phase-aware with progressive reveal */}
               {streaming && (
                 <div className="space-y-3">
-                  {/* Fetching phase: progress bar */}
+                  {/* Status indicator */}
                   {phase === 'fetching' && (() => {
                     const pct = totalComments > 0 ? Math.round((fetchedComments / totalComments) * 100) : 0
                     const filled = Math.round(pct / 5)
@@ -259,27 +294,32 @@ export function SummarizeButton({
                       <div className="space-y-1.5">
                         <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
                           <Loader2 className="size-3 animate-spin shrink-0" />
-                          <span>Fetching discussion threads…</span>
+                          <span>{round === 2 ? 'Fetching replies…' : 'Fetching discussion…'}</span>
+                          {round === 2 && <span className="ml-auto text-[var(--muted-foreground)]/60">pass 2/2</span>}
                         </div>
-                        <div className="font-mono text-xs text-[var(--muted-foreground)] tracking-tight">
-                          [{bar}] {fetchedComments}/{totalComments > 0 ? totalComments : '?'}
-                        </div>
+                        {round === 2 && (
+                          <div className="font-mono text-xs text-[var(--muted-foreground)] tracking-tight">
+                            [{bar}] {fetchedComments}/{totalComments > 0 ? totalComments : '?'}
+                          </div>
+                        )}
                       </div>
                     )
                   })()}
 
-                  {/* Thinking phase: label */}
                   {phase === 'thinking' && (
                     <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
                       <Loader2 className="size-3 animate-spin shrink-0" />
                       <span>
-                        {streamedText
+                        {round === 2
+                          ? 'Refining with replies…'
+                          : streamedText
                           ? 'Building summary…'
                           : isReasoning
                           ? 'Model reasoning…'
                           : 'Analyzing comments…'}
                       </span>
-                      {isReasoning && (
+                      {round === 2 && <span className="ml-auto text-[var(--muted-foreground)]/60">pass 2/2</span>}
+                      {isReasoning && round !== 2 && (
                         <span className="flex gap-0.5">
                           {[0, 1, 2].map(i => (
                             <span key={i} className="inline-block w-1 h-1 rounded-full bg-amber-500 animate-pulse"
@@ -290,9 +330,18 @@ export function SummarizeButton({
                     </div>
                   )}
 
-                  {/* Progressive overview — appears as soon as extracted from stream */}
+                  {/* Between rounds — brief idle moment */}
+                  {phase === 'idle' && refining && (
+                    <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
+                      <Loader2 className="size-3 animate-spin shrink-0" />
+                      <span>Preparing second pass…</span>
+                    </div>
+                  )}
+
+                  {/* Overview — progressive (round 1) or stable from roundComplete (round 2) */}
                   {overview && (
                     <motion.p
+                      key={overview.slice(0, 20)}
                       initial={{ opacity: 0, y: 4 }}
                       animate={{ opacity: 1, y: 0 }}
                       className="text-sm text-[var(--foreground)] leading-relaxed"
@@ -301,7 +350,7 @@ export function SummarizeButton({
                     </motion.p>
                   )}
 
-                  {/* Progressive insights — each fades in as parsed */}
+                  {/* Insights — progressive (round 1) or stable from roundComplete (round 2) */}
                   {insights.length > 0 && (
                     <div className="space-y-2">
                       <p className="text-xs font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">

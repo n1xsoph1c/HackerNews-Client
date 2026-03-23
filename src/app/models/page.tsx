@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { ModelCard } from '@/components/models/ModelCard'
 import { PullForm } from '@/components/models/PullForm'
 import { PullProgress } from '@/components/models/PullProgress'
@@ -21,6 +21,8 @@ export default function ModelsPage() {
   const [ollamaDown, setOllamaDown] = useState(false)
   const [startupModel, setStartupModel] = useState<string | null>(null)
   const [autoPulling, setAutoPulling] = useState(false)
+  const [pullingModel, setPullingModel] = useState<string | null>(null)
+  const isInitialMount = useRef(true)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -40,8 +42,10 @@ export default function ModelsPage() {
         setModels(installed)
         const sm: string | null = modelsData.startupModel ?? null
         setStartupModel(sm)
-        if (sm && !installed.some(m => m.name === sm)) {
+        // Only trigger auto-pull on initial mount, not on refresh, and only if not already pulling
+        if (isInitialMount.current && sm && !installed.some(m => m.name === sm) && !pullingModel) {
           setAutoPulling(true)
+          setPullingModel(sm)
         }
       }
       setActiveModel(activeData.model ?? '')
@@ -49,10 +53,17 @@ export default function ModelsPage() {
       setOllamaDown(true)
     } finally {
       setLoading(false)
+      isInitialMount.current = false
     }
-  }, [])
+  }, [pullingModel])
 
   useEffect(() => { refresh() }, [refresh])
+
+  function handlePullComplete() {
+    setAutoPulling(false)
+    setPullingModel(null)
+    refresh()
+  }
 
   async function handleSetActive(modelName: string) {
     await fetch('/api/ollama/active', {
@@ -61,6 +72,11 @@ export default function ModelsPage() {
       body: JSON.stringify({ model: modelName }),
     })
     setActiveModel(modelName)
+    // If user sets active to a model we're pulling, clear the pulling state
+    if (pullingModel === modelName) {
+      setPullingModel(null)
+      setAutoPulling(false)
+    }
     toast.success(`Active model set to ${modelName}`)
   }
 
@@ -96,7 +112,7 @@ export default function ModelsPage() {
           </p>
           <PullProgress
             model={startupModel}
-            onComplete={() => { setAutoPulling(false); refresh() }}
+            onComplete={handlePullComplete}
           />
         </div>
       )}

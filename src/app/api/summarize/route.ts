@@ -5,10 +5,13 @@ import {
   getOllamaClient,
   buildSummaryMessages,
   selectCommentsForSummary,
+  SummarySchema,
   SummaryJsonSchema,
+  findCommentId,
 } from "@/lib/ollama"
-import { fetchStoryWithComments } from "@/lib/hn-api"
-import { getInFlightPromise, parseCacheAndStore } from "@/lib/summarize-background"
+import { fetchStoryShallow, fetchDepth1ForComments, type HNComment } from "@/lib/hn-api"
+import { getCachedStory } from "@/lib/story-cache"
+import { getInFlightPromise, isOllamaBusy, parseCacheAndStore } from "@/lib/summarize-background"
 
 export const maxDuration = 300
 
@@ -44,7 +47,6 @@ export async function POST(request: NextRequest) {
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          // Emit a waiting token so the client knows something is happening
           controller.enqueue(encoder.encode(
             `data: ${JSON.stringify({ type: "token", token: "" })}\n\n`
           ))
@@ -64,7 +66,6 @@ export async function POST(request: NextRequest) {
               })}\n\n`
             ))
           } else {
-            // Background job failed — fall through would require re-fetch; emit error
             controller.enqueue(encoder.encode(
               `data: ${JSON.stringify({ type: "error", message: "Summary generation failed, please try again" })}\n\n`
             ))
@@ -81,44 +82,70 @@ export async function POST(request: NextRequest) {
     return new Response(stream, sseHeaders())
   }
 
-  // No cache, no in-flight — generate now (explicit user request, always proceeds)
-  // fetchStoryWithComments is moved inside the stream so the HTTP response starts immediately
+  // Ollama is busy with a different story's background pre-gen — wait for it then serve cache
+  // This prevents the UI from getting stuck when user clicks Summarize while pre-gen is running
+  if (isOllamaBusy()) {
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ type: "token", token: "" })}\n\n`
+          ))
+          // Poll until ollamaBusy is false, then check for cached summary
+          let timeout = 0
+          while (isOllamaBusy() && timeout < 120000) {
+            await new Promise(r => setTimeout(r, 500))
+            timeout += 500
+          }
+          const fresh = await db.summary.findUnique({ where: { storyId } })
+          if (fresh?.overview) {
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({
+                type: "complete",
+                overview: fresh.overview,
+                insights: fresh.insights,
+                worthReading: fresh.worthReading,
+                verdict: fresh.verdict,
+                sentiment: fresh.sentiment,
+                keyPoints: fresh.keyPoints,
+                summary: fresh.summary,
+              })}\n\n`
+            ))
+          } else {
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ type: "error", message: "Summary generation timed out, please try again" })}\n\n`
+            ))
+          }
+        } catch (err) {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`
+          ))
+        } finally {
+          controller.close()
+        }
+      },
+    })
+    return new Response(stream, sseHeaders())
+  }
+
+  // No cache, no in-flight — generate incrementally in up to 2 rounds:
+  //   Round 1: shallow comments (from StoryCache, essentially free) → immediate summary
+  //   Round 2: depth-1 replies fetched in one parallel batch → refined summary + DB cache
   const encoder = new TextEncoder()
   const ollama = getOllamaClient()
 
   const stream = new ReadableStream({
     async start(controller) {
-      let fullText = ""
-      try {
-        // Signal: fetching comments from HN API
-        controller.enqueue(encoder.encode(
-          `data: ${JSON.stringify({ type: "phase", phase: "fetching" })}\n\n`
-        ))
+      function emit(event: Record<string, unknown>) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+      }
 
-        const storyData = await fetchStoryWithComments(storyId, (fetched, total) => {
-          controller.enqueue(encoder.encode(
-            `data: ${JSON.stringify({ type: "progress", fetched, total })}\n\n`
-          ))
-        })
-        if (!storyData) {
-          controller.enqueue(encoder.encode(
-            `data: ${JSON.stringify({ type: "error", message: "Story not found" })}\n\n`
-          ))
-          return
-        }
-
-        const title = storyTitle || storyData.story.title
-        const commentsText = selectCommentsForSummary(storyData.comments, model)
+      async function runLLM(commentsText: string, title: string): Promise<string> {
         const messages = buildSummaryMessages(commentsText, title)
-
-        // Signal: LLM is now generating
-        controller.enqueue(encoder.encode(
-          `data: ${JSON.stringify({ type: "phase", phase: "thinking" })}\n\n`
-        ))
-
         const abort = new AbortController()
         const timeout = setTimeout(() => abort.abort(), 120_000)
-
+        let fullText = ""
         try {
           const response = await ollama.chat({
             model,
@@ -127,40 +154,104 @@ export async function POST(request: NextRequest) {
             stream: true,
             options: { temperature: 0 },
           })
-
           for await (const chunk of response) {
-            // Thinking models (qwen3, deepseek-r1, etc.) put reasoning in message.thinking
-            // and emit empty content tokens during that phase — detect and signal separately
             const thinking = (chunk.message as unknown as Record<string, unknown>).thinking
-            if (thinking) {
-              controller.enqueue(encoder.encode(
-                `data: ${JSON.stringify({ type: "reasoning" })}\n\n`
-              ))
-            }
-
+            if (thinking) emit({ type: "reasoning" })
             const token = chunk.message.content
             if (token) {
               fullText += token
-              controller.enqueue(encoder.encode(
-                `data: ${JSON.stringify({ type: "token", token })}\n\n`
-              ))
+              emit({ type: "token", token })
             }
           }
         } finally {
           clearTimeout(timeout)
         }
+        return fullText
+      }
 
-        // Parse, cache, and send complete event
-        const result = await parseCacheAndStore(fullText, storyId, model, storyData.comments)
+      function parseRound1(fullText: string, comments: HNComment[]) {
+        const parsed = SummarySchema.parse(JSON.parse(fullText))
+        const worthReading = (parsed.worth_reading ?? []).map(wr => ({
+          ...wr,
+          commentId: findCommentId(comments, wr.author, wr.preview),
+        }))
+        return {
+          overview: parsed.overview,
+          insights: parsed.insights,
+          worthReading,
+          verdict: parsed.verdict,
+          sentiment: parsed.sentiment,
+          keyPoints: parsed.insights.map(i => i.title),
+        }
+      }
+
+      try {
+        // ── Round 1: shallow comments ──────────────────────────────────────
+        emit({ type: "roundStart", round: 1, totalRounds: 2 })
+
+        const cachedStory = await getCachedStory(storyId)
+        let shallowComments = cachedStory?.comments
+
+        if (!shallowComments) {
+          // Cache miss — fetch shallow (fast: ~20-50 API calls)
+          emit({ type: "phase", phase: "fetching" })
+          const fetched = await fetchStoryShallow(storyId)
+          if (!fetched) {
+            emit({ type: "error", message: "Story not found" })
+            return
+          }
+          shallowComments = fetched.comments
+        }
+
+        const title = storyTitle ?? cachedStory?.story.title ?? String(storyId)
+
+        emit({ type: "phase", phase: "thinking" })
+        const round1Text = await runLLM(selectCommentsForSummary(shallowComments, model), title)
+
+        let round1Result: ReturnType<typeof parseRound1> | null = null
+        try {
+          round1Result = parseRound1(round1Text, shallowComments)
+          emit({ type: "roundComplete", round: 1, ...round1Result })
+        } catch {
+          // Round 1 parse failed — proceed to round 2 silently
+        }
+
+        // ── Round 2: depth-1 replies ───────────────────────────────────────
+        const hasReplies = shallowComments.some(c => c.kids && c.kids.length > 0)
+
+        if (!hasReplies) {
+          // No replies exist — round 1 is final; cache and emit complete
+          if (round1Result) {
+            await parseCacheAndStore(round1Text, storyId, model, shallowComments)
+            emit({ type: "complete", ...round1Result })
+          } else {
+            emit({ type: "error", message: "Failed to parse summary" })
+          }
+          return
+        }
+
+        emit({ type: "roundStart", round: 2, totalRounds: 2 })
+        emit({ type: "phase", phase: "fetching" })
+
+        const enrichedComments = await fetchDepth1ForComments(
+          shallowComments,
+          (fetched, total) => emit({ type: "progress", fetched, total })
+        )
+
+        emit({ type: "phase", phase: "thinking" })
+        const round2Text = await runLLM(selectCommentsForSummary(enrichedComments, model), title)
+
+        const result = await parseCacheAndStore(round2Text, storyId, model, enrichedComments)
         if (result) {
-          controller.enqueue(encoder.encode(
-            `data: ${JSON.stringify({ type: "complete", ...result })}\n\n`
-          ))
+          emit({ type: "complete", ...result })
+        } else if (round1Result) {
+          // Round 2 parse failed — fall back to cached round 1
+          emit({ type: "complete", ...round1Result })
+        } else {
+          emit({ type: "error", message: "Failed to generate summary" })
         }
       } catch (err) {
-        controller.enqueue(encoder.encode(
-          `data: ${JSON.stringify({ type: "error", message: String(err) })}\n\n`
-        ))
+        emit({ type: "error", message: String(err) })
       } finally {
         controller.close()
       }
