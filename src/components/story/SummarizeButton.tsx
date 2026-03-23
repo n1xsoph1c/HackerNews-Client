@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   Sparkles, Loader2, ChevronDown, ChevronUp,
   Info, MessageSquare, AlertTriangle, Lightbulb, ArrowLeftRight,
@@ -97,6 +97,7 @@ export function SummarizeButton({
   storyId: number
   storyTitle: string
 }) {
+  const summaryRef = useRef<HTMLDivElement>(null)
   const [state, setState] = useState<SummaryState>({
     streaming: false,
     phase: 'idle',
@@ -143,6 +144,8 @@ export function SummarizeButton({
   async function summarize() {
     setState(s => ({ ...s, streaming: true, phase: 'fetching', isReasoning: false, fetchedComments: 0, totalComments: 0, streamedText: '', overview: '', insights: [], worthReading: [], verdict: '', sentiment: '', done: false, error: null }))
     setOpen(true)
+    // Scroll summary into view on mobile (it may be above the fold if user scrolled to comments)
+    setTimeout(() => summaryRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
 
     try {
       const res = await fetch('/api/summarize', {
@@ -236,11 +239,11 @@ export function SummarizeButton({
       <AnimatePresence>
         {(streaming || done) && open && (
           <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
+            ref={summaryRef}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
             transition={{ duration: 0.2 }}
-            className="overflow-hidden"
           >
             <div className="p-4 rounded-xl bg-[var(--surface)] border border-[var(--border-color)] space-y-4">
 
