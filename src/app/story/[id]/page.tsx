@@ -1,5 +1,6 @@
 import { Suspense } from 'react'
 import { notFound } from 'next/navigation'
+import { after } from 'next/server'
 import { fetchStoryShallow } from '@/lib/hn-api'
 import { getCachedStory, setCachedStory } from '@/lib/story-cache'
 import { preSummarizeIfNeeded } from '@/lib/summarize-background'
@@ -33,8 +34,8 @@ export default async function StoryPage({
     setCachedStory(storyId, story, comments).catch(console.error)
   }
 
-  // Pre-generate summary in background while user reads — will be instant when they click
-  preSummarizeIfNeeded(storyId, story.title).catch(() => {})
+  // Pre-generate summary after response is sent — will be instant when user clicks Summarize
+  after(() => preSummarizeIfNeeded(storyId, story.title).catch(() => {}))
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-6">

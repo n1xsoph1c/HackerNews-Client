@@ -1,4 +1,5 @@
 import { Ollama } from "ollama"
+import { z } from "zod"
 import { db } from "./db"
 import type { HNComment } from "./hn-api"
 
@@ -15,6 +16,27 @@ export async function getActiveModel(): Promise<string> {
   }
 }
 
+// Zod schema — used for grammar-constrained generation via Ollama format param
+export const SummarySchema = z.object({
+  overview: z.string(),
+  insights: z.array(z.object({
+    title: z.string(),
+    detail: z.string(),
+    author: z.string().nullable(),
+    type: z.enum(["fact", "debate", "warning", "tip", "counterpoint"]),
+  })),
+  worth_reading: z.array(z.object({
+    author: z.string(),
+    preview: z.string(),
+    why: z.string(),
+  })),
+  sentiment: z.enum(["positive", "negative", "mixed", "neutral"]),
+  verdict: z.string(),
+})
+
+export type SummaryOutput = z.infer<typeof SummarySchema>
+export const SummaryJsonSchema = z.toJSONSchema(SummarySchema)
+
 // Context budget by model family — larger models get more input chars
 function getContextBudget(model: string): number {
   if (model.includes("70b") || model.includes("72b")) return 12000
@@ -29,7 +51,12 @@ function flattenAll(comments: HNComment[]): FlatComment[] {
   function walk(items: HNComment[]) {
     for (const c of items) {
       if (c.by && c.text) {
-        const clean = c.text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+        const clean = c.text
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&")
+          .replace(/&#x2F;/gi, "/").replace(/&#x27;/gi, "'").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+          .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+          .replace(/\s+/g, " ").trim()
         if (clean.length >= 40) result.push({ id: c.id, by: c.by, text: clean, depth: c.depth })
       }
       if (c.children.length > 0) walk(c.children)
@@ -51,10 +78,13 @@ export function selectCommentsForSummary(
 
   if (all.length === 0) return ""
 
+  // Cap each comment at 800 chars so long comments don't monopolize the budget
+  const capped = all.map(c => ({ ...c, text: c.text.slice(0, 800) }))
+
   // Bucket by depth, sort each bucket by length descending
-  const d0 = all.filter(c => c.depth === 0).sort((a, b) => b.text.length - a.text.length)
-  const d1 = all.filter(c => c.depth === 1).sort((a, b) => b.text.length - a.text.length)
-  const d2 = all.filter(c => c.depth >= 2).sort((a, b) => b.text.length - a.text.length)
+  const d0 = capped.filter(c => c.depth === 0).sort((a, b) => b.text.length - a.text.length)
+  const d1 = capped.filter(c => c.depth === 1).sort((a, b) => b.text.length - a.text.length)
+  const d2 = capped.filter(c => c.depth >= 2).sort((a, b) => b.text.length - a.text.length)
 
   // Within each bucket, interleave beginning/middle/end for thread breadth
   function spreadSample<T>(arr: T[], take: number): T[] {
@@ -81,7 +111,7 @@ export function selectCommentsForSummary(
   let total = 0
   for (const c of pool) {
     const line = `[${c.by}]: ${c.text}`
-    if (total + line.length + 1 > budget) continue  // skip if too long, try next
+    if (total + line.length + 1 > budget) continue
     lines.push(line)
     total += line.length + 1
   }
@@ -92,33 +122,10 @@ export function selectCommentsForSummary(
 export function buildRichSummaryPrompt(commentsText: string, storyTitle: string): string {
   return `You are analyzing a Hacker News discussion. Story: "${storyTitle}"
 
-Respond ONLY with valid JSON in this exact format:
-{
-  "overview": "2-3 sentences: what is this about and why does the HN community care",
-  "insights": [
-    {
-      "title": "3-6 word label",
-      "detail": "explanation — one line if obvious, up to 2 sentences with backstory if complex or technical",
-      "author": "username or null if synthesized from multiple",
-      "type": "fact|debate|warning|tip|counterpoint"
-    }
-  ],
-  "worth_reading": [
-    {
-      "author": "username",
-      "preview": "exact first 80 characters of their comment text with no HTML tags",
-      "why": "one sentence: why this specific comment is worth reading"
-    }
-  ],
-  "sentiment": "positive|negative|mixed|neutral",
-  "verdict": "one opinionated sentence summing up this discussion"
-}
-
 Rules:
-- Output ONLY the JSON object. No preamble, no explanation, no markdown code fences.
 - insights: 4-7 items, most important first
-- worth_reading: 2-4 real authors with real text (not synthesized — must exist in comments below)
-- preview MUST be exact text from the comments — it is used for navigation
+- worth_reading: 2-4 real authors that exist in the comments below (not synthesized)
+- preview must be the exact first ~75 characters of their comment text
 - Be specific: reference actual claims, tools, names, numbers from the discussion
 
 Comments:
@@ -133,7 +140,7 @@ export function findCommentId(
 ): number | null {
   const normalize = (s: string) =>
     s.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().toLowerCase()
-  const needle = normalize(preview).slice(0, 60)
+  const needle = normalize(preview).slice(0, 75)
   if (!needle) return null
 
   const flat = flattenAll(comments)
@@ -143,43 +150,4 @@ export function findCommentId(
     }
   }
   return null
-}
-
-// @deprecated — kept for backward compat, use selectCommentsForSummary instead
-export function flattenComments(
-  comments: { by?: string; text?: string; children?: unknown[] }[],
-  maxChars = 1500
-): string {
-  const lines: string[] = []
-  let total = 0
-  function walk(items: { by?: string; text?: string; children?: unknown[] }[], depth = 0) {
-    for (const c of items) {
-      if (total >= maxChars) return
-      if (c.text && c.by) {
-        const clean = c.text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
-        const line = `[${c.by}]: ${clean}`
-        if (total + line.length > maxChars) return
-        lines.push(line)
-        total += line.length + 1
-      }
-      if (c.children && depth < 3) walk(c.children as typeof comments, depth + 1)
-    }
-  }
-  walk(comments)
-  return lines.join("\n")
-}
-
-// @deprecated — kept for backward compat
-export function buildSummaryPrompt(commentsText: string): string {
-  return `You are analyzing a Hacker News discussion thread. Based on the comments below, provide a structured analysis.
-
-Respond with ONLY valid JSON in this exact format:
-{
-  "keyPoints": ["point 1", "point 2", "point 3"],
-  "sentiment": "positive" | "negative" | "mixed" | "neutral",
-  "summary": "2-3 sentence overview of the discussion"
-}
-
-Comments:
-${commentsText}`
 }

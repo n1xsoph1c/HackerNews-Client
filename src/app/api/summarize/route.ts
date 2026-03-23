@@ -5,6 +5,7 @@ import {
   getOllamaClient,
   buildRichSummaryPrompt,
   selectCommentsForSummary,
+  SummaryJsonSchema,
 } from "@/lib/ollama"
 import { fetchStoryWithComments } from "@/lib/hn-api"
 import { getInFlightPromise, parseCacheAndStore } from "@/lib/summarize-background"
@@ -81,57 +82,59 @@ export async function POST(request: NextRequest) {
   }
 
   // No cache, no in-flight — generate now (explicit user request, always proceeds)
-  const storyData = await fetchStoryWithComments(storyId)
-  if (!storyData) {
-    return new Response("Story not found", { status: 404 })
-  }
-
-  const title = storyTitle || storyData.story.title
-  const commentsText = selectCommentsForSummary(storyData.comments, model)
-  const prompt = buildRichSummaryPrompt(commentsText, title)
-  const ollama = getOllamaClient()
+  // fetchStoryWithComments is moved inside the stream so the HTTP response starts immediately
   const encoder = new TextEncoder()
+  const ollama = getOllamaClient()
 
   const stream = new ReadableStream({
     async start(controller) {
       let fullText = ""
       try {
-        const response = await ollama.chat({
-          model,
-          messages: [{ role: "user", content: prompt }],
-          stream: true,
-          options: { temperature: 0, num_predict: 400 },
-        })
+        // Emit a waiting token immediately so the client knows work has started
+        controller.enqueue(encoder.encode(
+          `data: ${JSON.stringify({ type: "token", token: "" })}\n\n`
+        ))
 
-        for await (const chunk of response) {
-          const token = chunk.message.content
-          fullText += token
+        const storyData = await fetchStoryWithComments(storyId)
+        if (!storyData) {
           controller.enqueue(encoder.encode(
-            `data: ${JSON.stringify({ type: "token", token })}\n\n`
+            `data: ${JSON.stringify({ type: "error", message: "Story not found" })}\n\n`
           ))
+          return
+        }
+
+        const title = storyTitle || storyData.story.title
+        const commentsText = selectCommentsForSummary(storyData.comments, model)
+        const prompt = buildRichSummaryPrompt(commentsText, title)
+
+        const abort = new AbortController()
+        const timeout = setTimeout(() => abort.abort(), 120_000)
+
+        try {
+          const response = await ollama.chat({
+            model,
+            messages: [{ role: "user", content: prompt }],
+            format: SummaryJsonSchema,
+            stream: true,
+            options: { temperature: 0 },
+          })
+
+          for await (const chunk of response) {
+            const token = chunk.message.content
+            fullText += token
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ type: "token", token })}\n\n`
+            ))
+          }
+        } finally {
+          clearTimeout(timeout)
         }
 
         // Parse, cache, and send complete event
-        try {
-          const result = await parseCacheAndStore(fullText, storyId, model, storyData.comments)
-          if (result) {
-            controller.enqueue(encoder.encode(
-              `data: ${JSON.stringify({ type: "complete", ...result })}\n\n`
-            ))
-          }
-        } catch {
-          // JSON parse failed — send raw text as fallback
+        const result = await parseCacheAndStore(fullText, storyId, model, storyData.comments)
+        if (result) {
           controller.enqueue(encoder.encode(
-            `data: ${JSON.stringify({
-              type: "complete",
-              overview: fullText,
-              insights: [],
-              worthReading: [],
-              verdict: "",
-              sentiment: "neutral",
-              keyPoints: [],
-              summary: fullText,
-            })}\n\n`
+            `data: ${JSON.stringify({ type: "complete", ...result })}\n\n`
           ))
         }
       } catch (err) {

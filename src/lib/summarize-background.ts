@@ -5,8 +5,11 @@ import {
   selectCommentsForSummary,
   buildRichSummaryPrompt,
   findCommentId,
+  SummarySchema,
+  SummaryJsonSchema,
 } from './ollama'
 import { fetchStoryWithComments } from './hn-api'
+import { getCachedStory } from './story-cache'
 
 // Module-level state — single Next.js process, single Ollama instance
 const inFlightPromises = new Map<string, Promise<void>>()
@@ -42,32 +45,45 @@ export async function preSummarizeIfNeeded(
 
   // Start the job
   ollamaBusy = true
-  const promise = runSummarize(storyId, storyTitle, model).finally(() => {
-    inFlightPromises.delete(key)
-    ollamaBusy = false
-  })
+  const promise = runSummarize(storyId, storyTitle, model)
+    .catch((err) => console.error('[pre-summ] error:', err))
+    .finally(() => {
+      inFlightPromises.delete(key)
+      ollamaBusy = false
+    })
   inFlightPromises.set(key, promise)
   return promise
 }
 
 async function runSummarize(storyId: number, storyTitle: string, model: string): Promise<void> {
-  const storyData = await fetchStoryWithComments(storyId)
-  if (!storyData) return
+  // Use shallow comments already in StoryCache — no extra API calls needed.
+  // Falls back to full tree fetch only if cache is cold (very rare for pre-gen).
+  const cachedStory = await getCachedStory(storyId)
+  const comments = cachedStory?.comments ?? (await fetchStoryWithComments(storyId))?.comments
+  if (!comments) return
 
-  const commentsText = selectCommentsForSummary(storyData.comments, model)
+  const commentsText = selectCommentsForSummary(comments, model)
   const prompt = buildRichSummaryPrompt(commentsText, storyTitle)
   const ollama = getOllamaClient()
 
-  let fullText = ''
-  const response = await ollama.chat({
-    model,
-    messages: [{ role: 'user', content: prompt }],
-    stream: true,
-    options: { temperature: 0, num_predict: 400 },
-  })
-  for await (const chunk of response) fullText += chunk.message.content
+  const abort = new AbortController()
+  const timeout = setTimeout(() => abort.abort(), 120_000)
 
-  await parseCacheAndStore(fullText, storyId, model, storyData.comments)
+  let fullText = ''
+  try {
+    const response = await ollama.chat({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      format: SummaryJsonSchema,
+      stream: true,
+      options: { temperature: 0 },
+    })
+    for await (const chunk of response) fullText += chunk.message.content
+  } finally {
+    clearTimeout(timeout)
+  }
+
+  await parseCacheAndStore(fullText, storyId, model, comments)
 }
 
 type WorthReadingRaw = { author: string; preview: string; why: string }
@@ -86,34 +102,23 @@ export async function parseCacheAndStore(
   sentiment: string
   keyPoints: string[]
 } | null> {
-  const jsonMatch = fullText.match(/\{[\s\S]*\}/)
-  if (!jsonMatch) return null
-
-  let parsed = JSON.parse(jsonMatch[0])
-
-  // Small model double-encoding fix: overview sometimes wraps the full JSON
-  if (parsed.overview && typeof parsed.overview === 'string' && parsed.overview.trim().startsWith('{')) {
-    try {
-      const inner = JSON.parse(parsed.overview)
-      if (inner.insights || inner.worth_reading) parsed = inner
-    } catch { /* not double-encoded */ }
-  }
+  const parsed = SummarySchema.parse(JSON.parse(fullText))
 
   const worthReadingRaw: WorthReadingRaw[] = parsed.worth_reading ?? []
   const worthReading = worthReadingRaw.map((wr) => ({
     ...wr,
     commentId: findCommentId(comments, wr.author, wr.preview),
   }))
-  const keyPoints = (parsed.insights ?? []).map((i: { title: string }) => i.title)
+  const keyPoints = parsed.insights.map((i) => i.title)
 
   const fields = {
-    overview: parsed.overview ?? '',
-    insights: parsed.insights ?? [],
+    overview: parsed.overview,
+    insights: parsed.insights,
     worthReading,
-    verdict: parsed.verdict ?? '',
-    sentiment: parsed.sentiment ?? 'neutral',
+    verdict: parsed.verdict,
+    sentiment: parsed.sentiment,
     keyPoints,
-    summary: parsed.overview ?? '',
+    summary: parsed.overview,
     model,
   }
 
