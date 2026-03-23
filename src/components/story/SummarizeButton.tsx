@@ -295,13 +295,11 @@ export function SummarizeButton({
                         <div className="flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
                           <Loader2 className="size-3 animate-spin shrink-0" />
                           <span>{round === 2 ? 'Fetching replies…' : 'Fetching discussion…'}</span>
-                          {round === 2 && <span className="ml-auto text-[var(--muted-foreground)]/60">pass 2/2</span>}
+                          <span className="ml-auto text-[var(--muted-foreground)]/60">pass {round}/2</span>
                         </div>
-                        {round === 2 && (
-                          <div className="font-mono text-xs text-[var(--muted-foreground)] tracking-tight">
-                            [{bar}] {fetchedComments}/{totalComments > 0 ? totalComments : '?'}
-                          </div>
-                        )}
+                        <div className="font-mono text-xs text-[var(--muted-foreground)] tracking-tight">
+                          [{bar}] {fetchedComments}/{totalComments > 0 ? totalComments : '?'}
+                        </div>
                       </div>
                     )
                   })()}

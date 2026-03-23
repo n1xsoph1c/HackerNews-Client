@@ -195,7 +195,7 @@ export async function POST(request: NextRequest) {
         if (!shallowComments) {
           // Cache miss — fetch shallow (fast: ~20-50 API calls)
           emit({ type: "phase", phase: "fetching" })
-          const fetched = await fetchStoryShallow(storyId)
+          const fetched = await fetchStoryShallow(storyId, (fetched, total) => emit({ type: "progress", fetched, total }))
           if (!fetched) {
             emit({ type: "error", message: "Story not found" })
             return

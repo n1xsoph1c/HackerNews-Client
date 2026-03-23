@@ -152,7 +152,8 @@ export async function fetchStoryWithComments(
 // Fetches only top-level (depth=0) comments — ~20-50 API calls vs 150+ for full tree.
 // Each comment has its original kids[] preserved but children: [] (unloaded placeholder).
 export async function fetchStoryShallow(
-  id: number
+  id: number,
+  onProgress?: (fetched: number, total: number) => void
 ): Promise<{ story: HNStory; comments: HNComment[] } | null> {
   const item = await fetchItem(id)
   if (!item || !("title" in item)) return null
@@ -160,7 +161,14 @@ export async function fetchStoryShallow(
   const story = item as HNStory
   if (!story.kids || story.kids.length === 0) return { story, comments: [] }
 
-  const rawItems = await Promise.all(story.kids.slice(0, 50).map(fetchItem))
+  const kidIds = story.kids.slice(0, 50)
+  const total = kidIds.length
+  const rawItems = await Promise.all(kidIds.map((kid, i) => 
+    fetchItem(kid).then((item) => {
+      onProgress?.(i + 1, total)
+      return item
+    })
+  ))
   const comments: HNComment[] = []
 
   for (const raw of rawItems) {
