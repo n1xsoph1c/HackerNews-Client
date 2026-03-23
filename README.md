@@ -1,3 +1,6 @@
+# Short Video Demo Link
+https://drive.google.com/file/d/1hgpymbLoPU5Hv9SftVgrECdqVOKqZIRj/view?usp=sharing
+
 # HN Reader
 
 A Hacker News client with AI-powered discussion summaries. One command to run everything.
